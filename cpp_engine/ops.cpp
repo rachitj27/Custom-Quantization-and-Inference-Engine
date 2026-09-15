@@ -9,9 +9,7 @@
 #include <stdexcept>
 #include <vector>
 
-// AVX-VNNI is reached through intrinsics, which are not a library: each one
-// compiles to a single machine instruction the CPU already has. Nothing is
-// linked and nothing is installed. The header ships with the compiler.
+
 #if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
 #include <immintrin.h>
 #define ENGINE_HAS_VNNI 1
@@ -35,13 +33,7 @@ inline float silu(float x) {
 // Which kernel conv2d_real dispatches to. Set once at startup.
 Kernel g_kernel = Kernel::ScalarInt8;
 
-// The original scalar INT8 core. One multiply-accumulate per iteration, which
-// is the whole reason quantization buys no speed on its own: an 8-bit multiply
-// and a 32-bit multiply both retire in about a cycle, so narrowing the numbers
-// without widening the instruction changes nothing.
-//
-// Produces real-valued (dequantized) outputs with folded BatchNorm and the
-// optional activation already applied.
+
 FloatTensor conv_scalar_int8(const Tensor& input, const Layer& layer, bool apply_silu) {
     const int in_ch = input.shape[0];
     const int in_h = input.shape[1];
@@ -111,17 +103,7 @@ FloatTensor conv_scalar_int8(const Tensor& input, const Layer& layer, bool apply
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// FP32 baseline
-//
-// Deliberately the same loop as conv_scalar_int8: same order, same bounds
-// checks, same memory access pattern. Only the arithmetic width changes, so a
-// difference in runtime is attributable to that and nothing else.
-//
-// The weights are the INT8 weights dequantized, not the original FP32 ones.
-// For a latency measurement those are the same thing, identical instruction
-// count and identical memory traffic, and it keeps the numerics comparable.
-// ---------------------------------------------------------------------------
+
 FloatTensor conv_scalar_fp32(const Tensor& input, const Layer& layer, bool apply_silu) {
     const int in_ch = input.shape[0];
     const int in_h = input.shape[1];
@@ -186,14 +168,7 @@ FloatTensor conv_scalar_fp32(const Tensor& input, const Layer& layer, bool apply
 
 #if ENGINE_HAS_VNNI
 
-// Only the vector kernel below is compiled for AVX-VNNI. The rest of this file,
-// including the two scalar kernels it gets measured against, keeps the
-// project's baseline codegen.
-//
-// This matters for the measurement, not just for portability. Passing -mavx2
-// to the whole build would let the compiler quietly vectorise the scalar
-// kernels too, and the comparison would then be between two vectorised loops
-// rather than between a scalar loop and a vector one.
+
 #pragma GCC push_options
 #pragma GCC target("avx2,avxvnni")
 
@@ -210,27 +185,7 @@ inline int32_t hsum(__m128i s) {
     return _mm_cvtsi128_si32(s);
 }
 
-// ---------------------------------------------------------------------------
-// INT8 through AVX-VNNI
-//
-// VPDPBUSD multiplies 32 unsigned bytes by 32 signed bytes and accumulates the
-// products into 8 int32 lanes, in a single instruction. Two things have to be
-// true before it can be used, and neither of them is about precision:
-//
-//   1. The reduction axis must be contiguous. The engine stores activations as
-//      planar CHW, where consecutive channels sit a whole feature map apart, so
-//      the input is transposed into a padded HWC scratch buffer first. That
-//      costs O(elements) against O(elements * out_ch * kh * kw) of real work.
-//
-//   2. Activations must be unsigned. The instruction is byte-unsigned times
-//      byte-signed, which is exactly why ONNX Runtime quantizes activations to
-//      uint8 and weights to int8. Adding 128 to every stored value converts the
-//      engine's signed activations, and moves the zero point along with them.
-//
-// Zero padding stays exact with no branches in the inner loop: border positions
-// are filled with the shifted zero point so they represent real 0, and the
-// per-channel weight sum subtracted at the end cancels them precisely.
-// ---------------------------------------------------------------------------
+
 FloatTensor conv_vnni_int8(const Tensor& input, const Layer& layer, bool apply_silu) {
     const int in_ch = input.shape[0];
     const int in_h = input.shape[1];

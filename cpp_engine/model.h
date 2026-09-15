@@ -44,33 +44,15 @@ struct Layer {
 
     std::unique_ptr<Tensor> weights;
 
-    // ---- Alternate kernel representations, built once at load time ----
-    //
-    // The same convolution can run three ways. Only the arrays the selected
-    // kernel needs are ever filled, so the unused ones cost nothing.
+  
 
-    // ScalarFp32: the identical weights, dequantized, in the same
-    // [oc][ic][kh][kw] order as the INT8 blob. Keeping the layout identical is
-    // the point: the FP32 and INT8 scalar kernels then differ in arithmetic
-    // width and nothing else, which is what makes the comparison mean anything.
+  
     std::vector<float> weights_fp32;
 
-    // VnniInt8: weights repacked to [oc][kh][kw][ic_padded] so that input
-    // channels -- the axis the convolution reduces over -- are contiguous.
-    // VPDPBUSD consumes 32 adjacent bytes from each operand, which the native
-    // [oc][ic][kh][kw] layout cannot supply, since there consecutive channels
-    // sit a whole feature map apart.
-    //
-    // ic is padded up to a multiple of 32 with zero weights. A zero weight adds
-    // nothing to the dot product and nothing to weight_sums, so the padding is
-    // arithmetically invisible and removes the need for a scalar tail loop.
+  
     std::vector<int8_t> weights_hwc;
 
-    // Sum of every weight in one output channel's window. VPDPBUSD computes
-    // sum(a * w) over raw bytes, but the convolution needs sum((a - z) * w).
-    // Because sum((a - z) * w) == sum(a * w) - z * sum(w), precomputing sum(w)
-    // turns the zero-point correction into one subtraction per output pixel
-    // instead of one per multiply-accumulate.
+    
     std::vector<int32_t> weight_sums;
 
     int ic_padded = 0;
@@ -133,8 +115,8 @@ struct Detection {
     int cls = 0;
 };
 
-// Which convolution implementation the engine runs.
-//
+
+
 //   ScalarInt8  the original loop, one INT8 multiply-accumulate at a time
 //   ScalarFp32  the same loop in FP32, as an arithmetic-width baseline
 //   VnniInt8    INT8 through AVX-VNNI, 32 multiply-accumulates per instruction
