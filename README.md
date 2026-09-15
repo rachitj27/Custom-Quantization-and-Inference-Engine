@@ -1,4 +1,4 @@
-# Custom AI Hardware Inference
+# Custom INT8 Quantization and C++ Inference Engine for YOLOv8n
 
 A fire and smoke detector that runs on hand written C++ instead of a machine learning library.
 
