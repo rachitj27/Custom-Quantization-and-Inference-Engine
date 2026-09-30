@@ -46,5 +46,26 @@
       "smoke": 0.9426
     },
     "note": "original weight-quantization scheme, kept for comparison"
+  },
+  {
+    "label": "Custom C++ engine (per-channel) FP32 GEMM, CUDA on T4",
+    "kernel": "cuda-fp32",
+    "min_ms": 295.2,
+    "median_ms": 365.1,
+    "map50": 0.8826,
+    "per_class": {
+      "fire": 0.7742,
+      "smoke": 0.9909
+    },
+    "gemm_ms": 10.92,
+    "phases_ms": {
+      "h2d": 2.62,
+      "im2col": 6.04,
+      "gemm": 16.25,
+      "d2h": 5.44,
+      "host_epilogue": 123.63,
+      "host_rest": 145.89
+    },
+    "note": "Colab Tesla T4, sm_75, CUDA 12.8; --bench 3 in one process. im2col plus the 2D register-tiled SGEMM from cuda-gemm-from-scratch, bit-identical to the verbatim kernel at M=N=K=4096 and passing all 32 of the network's shapes. GEMM is 10.92 ms per image measured warm by cuda/gemm_selftest, 4.041 GMAC at 370 GMAC/s, against 17.3 GMAC/s for AVX-VNNI on one laptop core. The wall clock is not GEMM-bound: only 30.4 ms of it is on the GPU and the remaining 269 ms is the host FP32 epilogue and the CPU requantize/concat/pool/NMS, measured with --cuda-profile (which serializes phases, so its 16.25 ms GEMM figure is inflated). mAP equals the INT8 kernels; it is 0.0010 below scalar-fp32's 0.8836, one borderline smoke box on a 51-box set, consistent with the FP32 reduction-order drift of at most 5 INT8 codes measured by compare_dumps.py. Layers 0 and 1 are byte-identical to the CPU FP32 kernel."
   }
 ]
