@@ -14,6 +14,12 @@
 # from the release tarball. That is what ASSET_URL is for.
 set -euo pipefail
 
+# Step out of anything this script is about to delete. A notebook that has
+# already %cd'd into the clone would otherwise lose its working directory the
+# moment ENGINE_DIR is removed, and every command after that fails with
+# "getcwd: cannot access parent directories".
+cd / 2>/dev/null || true
+
 BRANCH="${1:-cuda-gemm-speedup}"
 REPO="https://github.com/rachitj27/Custom-Quantization-and-Inference-Engine.git"
 ASSET_URL="https://github.com/rachitj27/Custom-Quantization-and-Inference-Engine/releases/download/engine-assets-v1/engine-assets.tar.gz"
