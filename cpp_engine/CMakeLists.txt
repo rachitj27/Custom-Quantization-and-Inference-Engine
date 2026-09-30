@@ -47,6 +47,7 @@ if(ENGINE_CUDA)
 
   target_sources(custom_engine PRIVATE
     cuda/device_probe.cu
+    cuda/gemm.cu
   )
   target_compile_definitions(custom_engine PRIVATE ENGINE_HAS_CUDA=1)
 
@@ -57,4 +58,14 @@ if(ENGINE_CUDA)
     "$<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;--ftz=false;--prec-div=true;--prec-sqrt=true;-lineinfo;-Xcompiler=-Wall,-Wextra>")
 
   set_target_properties(custom_engine PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+  # Exercises the kernels on their own, with no model or engine involved.
+  add_executable(gemm_selftest
+    cuda/gemm_selftest.cu
+    cuda/gemm.cu
+    cuda/gemm_reference.cu
+  )
+  target_include_directories(gemm_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_options(gemm_selftest PRIVATE
+    "$<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;--ftz=false;--prec-div=true;--prec-sqrt=true;-lineinfo>")
 endif()
