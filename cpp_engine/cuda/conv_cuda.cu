@@ -592,8 +592,11 @@ std::unique_ptr<Tensor> conv_cuda_int8_fused(const Tensor& input, const Layer& l
     CU(cudaGetLastError());
     if (prof) CU(cudaEventRecord(g_ev[4]));
 
-    // D2H is INT8 now, a quarter of the int32 accumulators
-    CU(cudaMemcpy(out->data, g_out.p, out_elems, cudaMemcpyDeviceToHost));
+    // D2H is INT8 now, a quarter of the int32 accumulators. Via the pinned
+    // buffer: copying straight into out->data is pageable, which the driver
+    // stages through its own buffer and costs more than the extra host memcpy.
+    CU(cudaMemcpy(g_stage_out.p, g_out.p, out_elems, cudaMemcpyDeviceToHost));
+    std::memcpy(out->data, g_stage_out.p, out_elems);
 
     if (prof) {
         CU(cudaEventRecord(g_ev[5]));
