@@ -20,6 +20,12 @@ void cuda_release();
 FloatTensor conv_cuda_fp32(const Tensor& input, const Layer& layer, bool apply_silu);
 FloatTensor conv_cuda_int8(const Tensor& input, const Layer& layer, bool apply_silu);
 
+// fused: epilogue and requantize on the device, returns INT8 directly.
+// not byte-exact against the host path, see epilogue_int8.
+std::unique_ptr<Tensor> conv_cuda_int8_fused(const Tensor& input, const Layer& layer,
+                                             float out_scale, int out_zp,
+                                             bool apply_silu, const Tensor* residual);
+
 // phase timing. off by default: syncing per phase serializes the pipeline.
 struct CudaPhaseTimes {
     double h2d_ms = 0.0;

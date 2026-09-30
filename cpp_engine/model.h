@@ -124,7 +124,9 @@ struct Detection {
 //   VnniInt8    INT8 through AVX-VNNI, 32 multiply-accumulates per instruction
 //   CudaFp32    im2col plus an FP32 GEMM on the GPU
 //   CudaInt8    im2col plus an INT8 GEMM on the GPU, dp4a for the dot product
-enum class Kernel { ScalarInt8, ScalarFp32, VnniInt8, CudaFp32, CudaInt8 };
+//   CudaInt8Fused  the same, with the epilogue and requantize on the device
+enum class Kernel { ScalarInt8, ScalarFp32, VnniInt8, CudaFp32, CudaInt8,
+                    CudaInt8Fused };
 
 const char* kernel_name(Kernel k);
 bool parse_kernel(const std::string& name, Kernel& out);

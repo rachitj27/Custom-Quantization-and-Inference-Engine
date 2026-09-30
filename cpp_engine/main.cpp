@@ -111,6 +111,7 @@ void print_usage() {
         "                            vnni-int8    INT8 via AVX-VNNI, 32 per instruction\n"
         "                            cuda-fp32    im2col plus an FP32 GEMM on the GPU\n"
         "                            cuda-int8    im2col plus an INT8 dp4a GEMM on the GPU\n"
+        "                            cuda-int8-fused  the same, epilogue on the GPU too\n"
         "      --model-json <path> / --model-bin <path>\n";
 }
 
@@ -223,6 +224,11 @@ int main(int argc, char** argv) {
             std::cerr << "No usable CUDA device; falling back to scalar-fp32"
                       << std::endl;
             opt.kernel = Kernel::ScalarFp32;
+        }
+        if (opt.kernel == Kernel::CudaInt8Fused && !cuda_supported()) {
+            std::cerr << "No usable CUDA device; falling back to scalar-int8"
+                      << std::endl;
+            opt.kernel = Kernel::ScalarInt8;
         }
         if (opt.kernel == Kernel::CudaInt8 && !cuda_supported()) {
             std::cerr << "No usable CUDA device; falling back to scalar-int8"

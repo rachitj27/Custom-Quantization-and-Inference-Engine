@@ -71,14 +71,23 @@ struct LayerPlan {
     int icp = 0;
     GemmTile tile_fp32 = GemmTile::N128;
     IgemmTile tile_int8 = IgemmTile::N128;
+
+    // fused epilogue, per output channel. The input scale and zero point are
+    // only known at call time, so they stay scalars.
+    float* d_ws_gain = nullptr;  // weight_scales[oc] * bn_gain[oc]
+    float* d_bias = nullptr;
+    int* d_wsum = nullptr;       // weight_sums[oc]
 };
 
 std::vector<LayerPlan> g_plans;
 DeviceBuffer g_act;  // INT8 CHW activation
 DeviceBuffer g_a;    // im2col matrix
 DeviceBuffer g_c;    // GEMM output
+DeviceBuffer g_out;  // fused epilogue output, INT8 CHW
+DeviceBuffer g_res;  // residual, INT8
 PinnedBuffer g_stage_in;
 PinnedBuffer g_stage_out;
+PinnedBuffer g_stage_res;
 
 bool g_profile = false;
 CudaPhaseTimes g_times;
@@ -164,6 +173,38 @@ __global__ void im2col_int8(signed char* __restrict__ A, long long total, int kp
     }
 }
 
+// fused epilogue: correction, scale, bias, SiLU, optional residual, requantize.
+// C is [m][np] int32, out is CHW int8. Not byte-exact against the host path:
+// expf differs by a ULP and that can flip lroundf at a tie.
+__global__ void epilogue_int8(signed char* __restrict__ out,
+                              const int* __restrict__ C, int m, int n, int np,
+                              const float* __restrict__ ws_gain,
+                              const float* __restrict__ bias,
+                              const int* __restrict__ wsum, float in_scale,
+                              int in_zp, int silu,
+                              const signed char* __restrict__ residual,
+                              float res_scale, int res_zp, float out_scale,
+                              int out_zp) {
+    const long long total = (long long)m * n;
+    for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         idx < total; idx += (long long)blockDim.x * gridDim.x) {
+        const int oc = (int)(idx / m);
+        const int pix = (int)(idx - (long long)oc * m);
+
+        const int acc = C[(long long)pix * np + oc] - in_zp * wsum[oc];
+        float value = (in_scale * ws_gain[oc]) * (float)acc + bias[oc];
+        if (silu) value = value / (1.0f + expf(-value));
+        if (residual != nullptr) {
+            value += res_scale * (float)((int)residual[idx] - res_zp);
+        }
+
+        int q = (int)lroundf(value / out_scale) + out_zp;
+        q = q > 127 ? 127 : q;
+        q = q < -128 ? -128 : q;
+        out[idx] = (signed char)q;
+    }
+}
+
 float silu_host(float x) { return x / (1.0f + std::exp(-x)); }
 
 struct ConvDims {
@@ -204,7 +245,7 @@ void cuda_reset_phase_times() { g_times = CudaPhaseTimes(); }
 
 void cuda_prepare_layers(Model& model, Kernel kernel) {
     const bool fp32 = (kernel == Kernel::CudaFp32);
-    const bool int8 = (kernel == Kernel::CudaInt8);
+    const bool int8 = (kernel == Kernel::CudaInt8 || kernel == Kernel::CudaInt8Fused);
     if (!fp32 && !int8) return;
 
     cuda_release();
@@ -281,6 +322,22 @@ void cuda_prepare_layers(Model& model, Kernel kernel) {
             CU(cudaMalloc(&plan.d_b_int8, bytes.size()));
             CU(cudaMemcpy(plan.d_b_int8, bytes.data(), bytes.size(),
                           cudaMemcpyHostToDevice));
+
+            // epilogue tables
+            std::vector<float> ws_gain((size_t)oc), bias((size_t)oc);
+            for (int o = 0; o < oc; o++) {
+                ws_gain[(size_t)o] = layer.weight_scales[(size_t)o] * layer.bn_gain[(size_t)o];
+                bias[(size_t)o] = layer.bn_bias[(size_t)o];
+            }
+            CU(cudaMalloc(&plan.d_ws_gain, (size_t)oc * sizeof(float)));
+            CU(cudaMalloc(&plan.d_bias, (size_t)oc * sizeof(float)));
+            CU(cudaMalloc(&plan.d_wsum, (size_t)oc * sizeof(int)));
+            CU(cudaMemcpy(plan.d_ws_gain, ws_gain.data(), (size_t)oc * sizeof(float),
+                          cudaMemcpyHostToDevice));
+            CU(cudaMemcpy(plan.d_bias, bias.data(), (size_t)oc * sizeof(float),
+                          cudaMemcpyHostToDevice));
+            CU(cudaMemcpy(plan.d_wsum, layer.weight_sums.data(),
+                          (size_t)oc * sizeof(int), cudaMemcpyHostToDevice));
         }
 
         layer.cuda_slot = (int)g_plans.size();
@@ -292,15 +349,24 @@ void cuda_release() {
     for (LayerPlan& p : g_plans) {
         if (p.d_b_fp32) cudaFree(p.d_b_fp32);
         if (p.d_b_int8) cudaFree(p.d_b_int8);
+        if (p.d_ws_gain) cudaFree(p.d_ws_gain);
+        if (p.d_bias) cudaFree(p.d_bias);
+        if (p.d_wsum) cudaFree(p.d_wsum);
         p.d_b_fp32 = nullptr;
         p.d_b_int8 = nullptr;
+        p.d_ws_gain = nullptr;
+        p.d_bias = nullptr;
+        p.d_wsum = nullptr;
     }
     g_plans.clear();
     g_act.release();
     g_a.release();
     g_c.release();
+    g_out.release();
+    g_res.release();
     g_stage_in.release();
     g_stage_out.release();
+    g_stage_res.release();
     if (g_events_ready) {
         for (int i = 0; i < 6; i++) cudaEventDestroy(g_ev[i]);
         g_events_ready = false;
@@ -453,6 +519,91 @@ FloatTensor conv_cuda_int8(const Tensor& input, const Layer& layer, bool apply_s
         g_times.d2h_ms += elapsed(g_ev[3], g_ev[4]);
         g_times.epilogue_ms += elapsed(g_ev[4], g_ev[5]);
         g_times.launches += 2;
+    }
+
+    return out;
+}
+
+std::unique_ptr<Tensor> conv_cuda_int8_fused(const Tensor& input, const Layer& layer,
+                                             float out_scale, int out_zp,
+                                             bool apply_silu, const Tensor* residual) {
+    if (layer.cuda_slot < 0 || layer.cuda_slot >= (int)g_plans.size()) {
+        throw std::runtime_error("No CUDA plan for layer " + layer.path);
+    }
+    const LayerPlan& plan = g_plans[(size_t)layer.cuda_slot];
+    const ConvDims d = conv_dims(input, layer);
+
+    const IgemmTileShape ts = igemm_tile_shape(plan.tile_int8);
+    const int mp = round_up(d.m, ts.bm);
+    const int k4 = plan.kp / 4;
+    const size_t out_elems = (size_t)d.out_ch * d.m;
+
+    auto out = std::make_unique<Tensor>(
+        std::vector<int>{d.out_ch, d.out_h, d.out_w}, out_scale, out_zp);
+    if (residual != nullptr && residual->num_elements != out->num_elements) {
+        throw std::runtime_error("Residual shape mismatch at " + layer.path);
+    }
+
+    g_act.ensure(input.num_elements);
+    g_a.ensure((size_t)mp * plan.kp);
+    g_c.ensure((size_t)mp * plan.np * sizeof(int32_t));
+    g_out.ensure(out_elems);
+    g_stage_in.ensure(input.num_elements);
+    g_stage_out.ensure(out_elems);
+    if (residual != nullptr) {
+        g_res.ensure(out_elems);
+        g_stage_res.ensure(out_elems);
+    }
+
+    const bool prof = g_profile;
+    if (prof) ensure_events();
+
+    std::memcpy(g_stage_in.p, input.data, input.num_elements);
+    if (residual != nullptr) {
+        std::memcpy(g_stage_res.p, residual->data, out_elems);
+    }
+    if (prof) CU(cudaEventRecord(g_ev[0]));
+    CU(cudaMemcpy(g_act.p, g_stage_in.p, input.num_elements, cudaMemcpyHostToDevice));
+    if (residual != nullptr) {
+        CU(cudaMemcpy(g_res.p, g_stage_res.p, out_elems, cudaMemcpyHostToDevice));
+    }
+    if (prof) CU(cudaEventRecord(g_ev[1]));
+
+    const long long total = (long long)mp * plan.kp;
+    im2col_int8<<<im2col_blocks(total, 256), 256>>>(
+        (signed char*)g_a.p, total, plan.kp, (const signed char*)g_act.p, d.in_ch,
+        d.in_h, d.in_w, d.out_w, d.kh, d.kw, d.stride, d.pad, plan.icp,
+        input.zero_point, d.m);
+    CU(cudaGetLastError());
+    if (prof) CU(cudaEventRecord(g_ev[2]));
+
+    igemm_launch(plan.tile_int8, mp, plan.np, k4, (const int*)g_a.p,
+                 plan.d_b_int8, (int*)g_c.p, nullptr);
+    CU(cudaGetLastError());
+    if (prof) CU(cudaEventRecord(g_ev[3]));
+
+    epilogue_int8<<<im2col_blocks((long long)out_elems, 256), 256>>>(
+        (signed char*)g_out.p, (const int*)g_c.p, d.m, d.out_ch, plan.np,
+        plan.d_ws_gain, plan.d_bias, plan.d_wsum, input.scale, input.zero_point,
+        apply_silu ? 1 : 0,
+        residual != nullptr ? (const signed char*)g_res.p : nullptr,
+        residual != nullptr ? residual->scale : 0.0f,
+        residual != nullptr ? residual->zero_point : 0, out_scale, out_zp);
+    CU(cudaGetLastError());
+    if (prof) CU(cudaEventRecord(g_ev[4]));
+
+    // D2H is INT8 now, a quarter of the int32 accumulators
+    CU(cudaMemcpy(out->data, g_out.p, out_elems, cudaMemcpyDeviceToHost));
+
+    if (prof) {
+        CU(cudaEventRecord(g_ev[5]));
+        CU(cudaEventSynchronize(g_ev[5]));
+        g_times.h2d_ms += elapsed(g_ev[0], g_ev[1]);
+        g_times.im2col_ms += elapsed(g_ev[1], g_ev[2]);
+        g_times.gemm_ms += elapsed(g_ev[2], g_ev[3]);
+        g_times.epilogue_ms += elapsed(g_ev[3], g_ev[4]);
+        g_times.d2h_ms += elapsed(g_ev[4], g_ev[5]);
+        g_times.launches += 3;
     }
 
     return out;

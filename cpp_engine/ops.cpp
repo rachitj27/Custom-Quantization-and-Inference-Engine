@@ -303,7 +303,10 @@ FloatTensor conv2d_real(const Tensor& input, const Layer& layer, bool apply_silu
     if (g_kernel == Kernel::CudaFp32 && layer.cuda_slot >= 0) {
         return conv_cuda_fp32(input, layer, apply_silu);
     }
-    if (g_kernel == Kernel::CudaInt8 && layer.cuda_slot >= 0) {
+    // CudaInt8Fused reaches conv2d_real only from conv2d_float, which needs
+    // an FP32 result, so it borrows the unfused path there.
+    if ((g_kernel == Kernel::CudaInt8 || g_kernel == Kernel::CudaInt8Fused) &&
+        layer.cuda_slot >= 0) {
         return conv_cuda_int8(input, layer, apply_silu);
     }
 #endif
@@ -344,6 +347,12 @@ std::unique_ptr<Tensor> conv2d_quant(const Tensor& input,
                                      int out_zp,
                                      bool apply_silu,
                                      const Tensor* residual) {
+#if ENGINE_HAS_CUDA
+    if (g_kernel == Kernel::CudaInt8Fused && layer.cuda_slot >= 0) {
+        return conv_cuda_int8_fused(input, layer, out_scale, out_zp, apply_silu,
+                                    residual);
+    }
+#endif
     FloatTensor real = conv2d_real(input, layer, apply_silu);
 
     auto out = std::make_unique<Tensor>(real.shape, out_scale, out_zp);
