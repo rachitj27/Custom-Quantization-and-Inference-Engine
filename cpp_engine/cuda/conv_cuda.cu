@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "gemm.cuh"
+#include "igemm.cuh"
 
 namespace {
 
@@ -63,20 +64,23 @@ struct PinnedBuffer {
 };
 
 // Per-layer device state. M is absent because it depends on the input's
-// spatial size, which the caller supplies at inference time.
+// spatial size, which the caller supplies at inference time. Only the fields
+// for the active kernel are populated.
 struct LayerPlan {
-    float* d_b = nullptr;  // weight panel, [kp][np], padding zeroed
+    float* d_b_fp32 = nullptr;  // [kp][np], padding zeroed
+    int* d_b_int8 = nullptr;    // [kp/4][np] int32 words, padding zeroed
     int n = 0;
     int np = 0;
     int kp = 0;
     int icp = 0;
-    GemmTile tile = GemmTile::N128;
+    GemmTile tile_fp32 = GemmTile::N128;
+    IgemmTile tile_int8 = IgemmTile::N128;
 };
 
 std::vector<LayerPlan> g_plans;
 DeviceBuffer g_act;  // INT8 CHW activation
-DeviceBuffer g_a;    // im2col matrix, [mp][kp]
-DeviceBuffer g_c;    // GEMM output, [mp][np]
+DeviceBuffer g_a;    // im2col matrix
+DeviceBuffer g_c;    // GEMM output
 PinnedBuffer g_stage_in;
 PinnedBuffer g_stage_out;
 
@@ -97,12 +101,16 @@ float elapsed(cudaEvent_t a, cudaEvent_t b) {
     return ms;
 }
 
-// Builds A so that row m is output pixel m and column k is tap (r, c) of input
-// channel i, with k = (r * kw + c) * icp + i. That is the same order the VNNI
-// path packs its weights in, so the INT8 stage can reuse weights_hwc directly.
-//
-// Out-of-bounds taps and the channel padding are written as a real zero, which
-// is exactly what the scalar FP32 kernel contributes for them.
+// Column k of row m is tap (r, c) of input channel i, at
+// k = (r * kw + c) * icp + i. That is the order the VNNI path packs its
+// weights in, so weights_hwc transposes straight into the B panel.
+__device__ inline void decode_column(int k, int icp, int kw, int* i, int* r, int* c) {
+    *i = k % icp;
+    const int tap = k / icp;
+    *c = tap % kw;
+    *r = tap / kw;
+}
+
 __global__ void im2col_fp32(float* __restrict__ A, long long total, int kp,
                             const signed char* __restrict__ in, int in_ch,
                             int in_h, int in_w, int out_w, int kh, int kw,
@@ -115,10 +123,8 @@ __global__ void im2col_fp32(float* __restrict__ A, long long total, int kp,
 
         float v = 0.0f;
         if (m < m_real && k < k_real) {
-            const int i = k % icp;
-            const int tap = k / icp;
-            const int c = tap % kw;
-            const int r = tap / kw;
+            int i, r, c;
+            decode_column(k, icp, kw, &i, &r, &c);
             if (i < in_ch && r < kh) {
                 const int oh = m / out_w;
                 const int ow = m - oh * out_w;
@@ -134,7 +140,70 @@ __global__ void im2col_fp32(float* __restrict__ A, long long total, int kp,
     }
 }
 
+// The INT8 version keeps the quantized codes and fills every hole with
+// zero_point rather than 0. That is not cosmetic: the epilogue subtracts
+// zero_point * sum(w) over *all* K positions, so a spatially out-of-bounds tap
+// has to carry a code whose real value is zero, and that code is zero_point.
+// Writing 0 there would leave a smooth per-channel bias that still produces
+// plausible detections.
+__global__ void im2col_int8(signed char* __restrict__ A, long long total, int kp,
+                            const signed char* __restrict__ in, int in_ch,
+                            int in_h, int in_w, int out_w, int kh, int kw,
+                            int stride, int pad, int icp, int zero_point,
+                            int m_real) {
+    for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         idx < total; idx += (long long)blockDim.x * gridDim.x) {
+        const int m = (int)(idx / kp);
+        const int k = (int)(idx - (long long)m * kp);
+
+        signed char v = (signed char)zero_point;
+        if (m < m_real) {
+            int i, r, c;
+            decode_column(k, icp, kw, &i, &r, &c);
+            if (i < in_ch && r < kh) {
+                const int oh = m / out_w;
+                const int ow = m - oh * out_w;
+                const int ih = oh * stride + r - pad;
+                const int iw = ow * stride + c - pad;
+                if (ih >= 0 && ih < in_h && iw >= 0 && iw < in_w) {
+                    v = in[((long long)i * in_h + ih) * in_w + iw];
+                }
+            }
+        }
+        A[idx] = v;
+    }
+}
+
 float silu_host(float x) { return x / (1.0f + std::exp(-x)); }
+
+struct ConvDims {
+    int in_ch, in_h, in_w, out_ch, kh, kw, stride, pad, out_h, out_w, m;
+};
+
+ConvDims conv_dims(const Tensor& input, const Layer& layer) {
+    ConvDims d;
+    d.in_ch = input.shape[0];
+    d.in_h = input.shape[1];
+    d.in_w = input.shape[2];
+    d.out_ch = layer.weight_shape[0];
+    d.kh = layer.weight_shape[2];
+    d.kw = layer.weight_shape[3];
+    d.stride = layer.stride;
+    d.pad = layer.padding;
+    d.out_h = (d.in_h + 2 * d.pad - d.kh) / d.stride + 1;
+    d.out_w = (d.in_w + 2 * d.pad - d.kw) / d.stride + 1;
+    d.m = d.out_h * d.out_w;
+    if (d.in_ch != layer.weight_shape[1]) {
+        throw std::runtime_error("Channel mismatch in " + layer.path);
+    }
+    return d;
+}
+
+int im2col_blocks(long long total, int threads) {
+    long long b = (total + threads - 1) / threads;
+    if (b > 65535) b = 65535;
+    return (int)b;
+}
 
 }  // namespace
 
@@ -144,18 +213,22 @@ CudaPhaseTimes cuda_phase_times() { return g_times; }
 void cuda_reset_phase_times() { g_times = CudaPhaseTimes(); }
 
 void cuda_prepare_layers(Model& model, Kernel kernel) {
-    if (kernel != Kernel::CudaFp32) return;
+    const bool fp32 = (kernel == Kernel::CudaFp32);
+    const bool int8 = (kernel == Kernel::CudaInt8);
+    if (!fp32 && !int8) return;
 
     cuda_release();
-    g_plans.clear();
     g_plans.reserve(model.conv_layers.size());
 
-    for (size_t li = 0; li < model.conv_layers.size(); li++) {
-        Layer& layer = model.conv_layers[li];
+    for (Layer& layer : model.conv_layers) {
         if (layer.groups != 1) {
             throw std::runtime_error("Grouped convolution is not supported: " + layer.path);
         }
-        if (layer.weights_fp32.empty()) {
+        if (fp32 && layer.weights_fp32.empty()) {
+            layer.cuda_slot = -1;
+            continue;
+        }
+        if (int8 && layer.weights_hwc.empty()) {
             layer.cuda_slot = -1;
             continue;
         }
@@ -166,32 +239,63 @@ void cuda_prepare_layers(Model& model, Kernel kernel) {
         const int kw = layer.weight_shape[3];
 
         LayerPlan plan;
-        plan.icp = round_up(ic, 16);
         plan.n = oc;
-        plan.tile = gemm_choose_tile(oc);
+        plan.icp = int8 ? layer.ic_padded : round_up(ic, 16);
 
-        const GemmTileShape ts = gemm_tile_shape(plan.tile);
-        plan.np = round_up(oc, ts.bn);
-        plan.kp = round_up(kh * kw * plan.icp, ts.bk);
+        if (fp32) {
+            plan.tile_fp32 = gemm_choose_tile(oc);
+            const GemmTileShape ts = gemm_tile_shape(plan.tile_fp32);
+            plan.np = round_up(oc, ts.bn);
+            plan.kp = round_up(kh * kw * plan.icp, ts.bk);
 
-        // Transpose the OIHW panel into [kp][np] once, here, so the kernel's B
-        // loads stay coalesced along N and the hot path does no reordering.
-        std::vector<float> panel((size_t)plan.kp * plan.np, 0.0f);
-        for (int o = 0; o < oc; o++) {
-            for (int i = 0; i < ic; i++) {
-                for (int r = 0; r < kh; r++) {
-                    for (int c = 0; c < kw; c++) {
-                        const size_t src = (((size_t)o * ic + i) * kh + r) * kw + c;
-                        const int k = (r * kw + c) * plan.icp + i;
-                        panel[(size_t)k * plan.np + o] = layer.weights_fp32[src];
+            // Transpose OIHW into [kp][np] once, here, so the kernel's B loads
+            // stay coalesced along N and the hot path does no reordering.
+            std::vector<float> panel((size_t)plan.kp * plan.np, 0.0f);
+            for (int o = 0; o < oc; o++) {
+                for (int i = 0; i < ic; i++) {
+                    for (int r = 0; r < kh; r++) {
+                        for (int c = 0; c < kw; c++) {
+                            const size_t src = (((size_t)o * ic + i) * kh + r) * kw + c;
+                            const int k = (r * kw + c) * plan.icp + i;
+                            panel[(size_t)k * plan.np + o] = layer.weights_fp32[src];
+                        }
                     }
                 }
             }
-        }
+            CU(cudaMalloc(&plan.d_b_fp32, panel.size() * sizeof(float)));
+            CU(cudaMemcpy(plan.d_b_fp32, panel.data(), panel.size() * sizeof(float),
+                          cudaMemcpyHostToDevice));
+        } else {
+            plan.tile_int8 = igemm_choose_tile(oc);
+            const IgemmTileShape ts = igemm_tile_shape(plan.tile_int8);
+            plan.np = round_up(oc, ts.bn);
+            // No K rounding: kh*kw*icp is a multiple of 16, so kp/4 is always a
+            // multiple of bk4 = 4.
+            plan.kp = kh * kw * plan.icp;
 
-        CU(cudaMalloc(&plan.d_b, panel.size() * sizeof(float)));
-        CU(cudaMemcpy(plan.d_b, panel.data(), panel.size() * sizeof(float),
-                      cudaMemcpyHostToDevice));
+            // weights_hwc is [oc][kh][kw][icp], i.e. already a contiguous
+            // K-vector per output channel. All that is left is transposing it
+            // to K-major and grouping K in fours, which is what dp4a reads.
+            const int k4 = plan.kp / 4;
+            std::vector<signed char> bytes((size_t)k4 * plan.np * 4, 0);
+            for (int o = 0; o < oc; o++) {
+                for (int k = 0; k < plan.kp; k++) {
+                    int i, r, c;
+                    i = k % plan.icp;
+                    const int tap = k / plan.icp;
+                    c = tap % kw;
+                    r = tap / kw;
+                    if (i >= ic) continue;  // padded channel, weight stays 0
+                    const size_t src =
+                        (((size_t)o * kh + r) * kw + c) * plan.icp + i;
+                    bytes[((size_t)(k / 4) * plan.np + o) * 4 + (k % 4)] =
+                        layer.weights_hwc[src];
+                }
+            }
+            CU(cudaMalloc(&plan.d_b_int8, bytes.size()));
+            CU(cudaMemcpy(plan.d_b_int8, bytes.data(), bytes.size(),
+                          cudaMemcpyHostToDevice));
+        }
 
         layer.cuda_slot = (int)g_plans.size();
         g_plans.push_back(plan);
@@ -200,8 +304,10 @@ void cuda_prepare_layers(Model& model, Kernel kernel) {
 
 void cuda_release() {
     for (LayerPlan& p : g_plans) {
-        if (p.d_b) cudaFree(p.d_b);
-        p.d_b = nullptr;
+        if (p.d_b_fp32) cudaFree(p.d_b_fp32);
+        if (p.d_b_int8) cudaFree(p.d_b_int8);
+        p.d_b_fp32 = nullptr;
+        p.d_b_int8 = nullptr;
     }
     g_plans.clear();
     g_act.release();
@@ -220,79 +326,133 @@ FloatTensor conv_cuda_fp32(const Tensor& input, const Layer& layer, bool apply_s
         throw std::runtime_error("No CUDA plan for layer " + layer.path);
     }
     const LayerPlan& plan = g_plans[(size_t)layer.cuda_slot];
+    const ConvDims d = conv_dims(input, layer);
 
-    const int in_ch = input.shape[0];
-    const int in_h = input.shape[1];
-    const int in_w = input.shape[2];
-    if (in_ch != layer.weight_shape[1]) {
-        throw std::runtime_error("Channel mismatch in " + layer.path);
-    }
+    const int k_real = d.kh * d.kw * plan.icp;
+    const GemmTileShape ts = gemm_tile_shape(plan.tile_fp32);
+    const int mp = round_up(d.m, ts.bm);
 
-    const int out_ch = layer.weight_shape[0];
-    const int kh = layer.weight_shape[2];
-    const int kw = layer.weight_shape[3];
-    const int stride = layer.stride;
-    const int pad = layer.padding;
-    const int out_h = (in_h + 2 * pad - kh) / stride + 1;
-    const int out_w = (in_w + 2 * pad - kw) / stride + 1;
+    FloatTensor out({d.out_ch, d.out_h, d.out_w});
 
-    const int m = out_h * out_w;
-    const int k_real = kh * kw * plan.icp;
-    const GemmTileShape ts = gemm_tile_shape(plan.tile);
-    const int mp = round_up(m, ts.bm);
-
-    FloatTensor out({out_ch, out_h, out_w});
-
-    const size_t a_elems = (size_t)mp * plan.kp;
-    const size_t c_elems = (size_t)mp * plan.np;
     g_act.ensure(input.num_elements);
-    g_a.ensure(a_elems * sizeof(float));
-    g_c.ensure(c_elems * sizeof(float));
+    g_a.ensure((size_t)mp * plan.kp * sizeof(float));
+    g_c.ensure((size_t)mp * plan.np * sizeof(float));
     g_stage_in.ensure(input.num_elements);
-    g_stage_out.ensure((size_t)m * plan.n * sizeof(float));
+    g_stage_out.ensure((size_t)d.m * plan.n * sizeof(float));
 
     const bool prof = g_profile;
     if (prof) ensure_events();
 
-    // H2D
     std::memcpy(g_stage_in.p, input.data, input.num_elements);
     if (prof) CU(cudaEventRecord(g_ev[0]));
     CU(cudaMemcpy(g_act.p, g_stage_in.p, input.num_elements, cudaMemcpyHostToDevice));
     if (prof) CU(cudaEventRecord(g_ev[1]));
 
-    // im2col
     const long long total = (long long)mp * plan.kp;
-    const int threads = 256;
-    int blocks = (int)((total + threads - 1) / threads);
-    if (blocks > 65535) blocks = 65535;
-    im2col_fp32<<<blocks, threads>>>(
-        (float*)g_a.p, total, plan.kp, (const signed char*)g_act.p, in_ch, in_h,
-        in_w, out_w, kh, kw, stride, pad, plan.icp, input.scale,
-        input.zero_point, m, k_real);
+    im2col_fp32<<<im2col_blocks(total, 256), 256>>>(
+        (float*)g_a.p, total, plan.kp, (const signed char*)g_act.p, d.in_ch,
+        d.in_h, d.in_w, d.out_w, d.kh, d.kw, d.stride, d.pad, plan.icp,
+        input.scale, input.zero_point, d.m, k_real);
     CU(cudaGetLastError());
     if (prof) CU(cudaEventRecord(g_ev[2]));
 
-    // GEMM
-    gemm_launch(plan.tile, mp, plan.np, plan.kp, 1.0f, (const float*)g_a.p,
-                plan.d_b, 0.0f, (float*)g_c.p, nullptr);
+    gemm_launch(plan.tile_fp32, mp, plan.np, plan.kp, 1.0f, (const float*)g_a.p,
+                plan.d_b_fp32, 0.0f, (float*)g_c.p, nullptr);
     CU(cudaGetLastError());
     if (prof) CU(cudaEventRecord(g_ev[3]));
 
-    // D2H, useful sub-block only: C is [mp][np], we want [m][n].
     CU(cudaMemcpy2D(g_stage_out.p, (size_t)plan.n * sizeof(float), g_c.p,
                     (size_t)plan.np * sizeof(float), (size_t)plan.n * sizeof(float),
-                    (size_t)m, cudaMemcpyDeviceToHost));
+                    (size_t)d.m, cudaMemcpyDeviceToHost));
     if (prof) CU(cudaEventRecord(g_ev[4]));
 
     // Epilogue stays on the host. CUDA's expf is not glibc's, and a 1 ULP
     // difference in SiLU can flip lround at a requantization tie.
     const float* c = (const float*)g_stage_out.p;
-    for (int oc = 0; oc < out_ch; oc++) {
+    for (int oc = 0; oc < d.out_ch; oc++) {
         const float gain = layer.bn_gain[oc];
         const float bias = layer.bn_bias[oc];
-        float* dst = out.data.data() + (size_t)oc * out_h * out_w;
-        for (int pix = 0; pix < m; pix++) {
+        float* dst = out.data.data() + (size_t)oc * d.m;
+        for (int pix = 0; pix < d.m; pix++) {
             float value = gain * c[(size_t)pix * plan.n + oc] + bias;
+            if (apply_silu) value = silu_host(value);
+            dst[pix] = value;
+        }
+    }
+
+    if (prof) {
+        CU(cudaEventRecord(g_ev[5]));
+        CU(cudaEventSynchronize(g_ev[5]));
+        g_times.h2d_ms += elapsed(g_ev[0], g_ev[1]);
+        g_times.im2col_ms += elapsed(g_ev[1], g_ev[2]);
+        g_times.gemm_ms += elapsed(g_ev[2], g_ev[3]);
+        g_times.d2h_ms += elapsed(g_ev[3], g_ev[4]);
+        g_times.epilogue_ms += elapsed(g_ev[4], g_ev[5]);
+        g_times.launches += 2;
+    }
+
+    return out;
+}
+
+FloatTensor conv_cuda_int8(const Tensor& input, const Layer& layer, bool apply_silu) {
+    if (layer.cuda_slot < 0 || layer.cuda_slot >= (int)g_plans.size()) {
+        throw std::runtime_error("No CUDA plan for layer " + layer.path);
+    }
+    const LayerPlan& plan = g_plans[(size_t)layer.cuda_slot];
+    const ConvDims d = conv_dims(input, layer);
+
+    const IgemmTileShape ts = igemm_tile_shape(plan.tile_int8);
+    const int mp = round_up(d.m, ts.bm);
+    const int k4 = plan.kp / 4;
+
+    FloatTensor out({d.out_ch, d.out_h, d.out_w});
+
+    g_act.ensure(input.num_elements);
+    g_a.ensure((size_t)mp * plan.kp);
+    g_c.ensure((size_t)mp * plan.np * sizeof(int32_t));
+    g_stage_in.ensure(input.num_elements);
+    g_stage_out.ensure((size_t)d.m * plan.n * sizeof(int32_t));
+
+    const bool prof = g_profile;
+    if (prof) ensure_events();
+
+    std::memcpy(g_stage_in.p, input.data, input.num_elements);
+    if (prof) CU(cudaEventRecord(g_ev[0]));
+    CU(cudaMemcpy(g_act.p, g_stage_in.p, input.num_elements, cudaMemcpyHostToDevice));
+    if (prof) CU(cudaEventRecord(g_ev[1]));
+
+    const long long total = (long long)mp * plan.kp;
+    im2col_int8<<<im2col_blocks(total, 256), 256>>>(
+        (signed char*)g_a.p, total, plan.kp, (const signed char*)g_act.p, d.in_ch,
+        d.in_h, d.in_w, d.out_w, d.kh, d.kw, d.stride, d.pad, plan.icp,
+        input.zero_point, d.m);
+    CU(cudaGetLastError());
+    if (prof) CU(cudaEventRecord(g_ev[2]));
+
+    igemm_launch(plan.tile_int8, mp, plan.np, k4, (const int*)g_a.p,
+                 plan.d_b_int8, (int*)g_c.p, nullptr);
+    CU(cudaGetLastError());
+    if (prof) CU(cudaEventRecord(g_ev[3]));
+
+    CU(cudaMemcpy2D(g_stage_out.p, (size_t)plan.n * sizeof(int32_t), g_c.p,
+                    (size_t)plan.np * sizeof(int32_t),
+                    (size_t)plan.n * sizeof(int32_t), (size_t)d.m,
+                    cudaMemcpyDeviceToHost));
+    if (prof) CU(cudaEventRecord(g_ev[4]));
+
+    // Identical arithmetic to conv_vnni_int8's epilogue, on the same int32.
+    // sum((q - z) * w) == sum(q * w) - z * sum(w), and weight_sums holds
+    // sum(w) with the padded channels contributing nothing.
+    const int32_t* c = (const int32_t*)g_stage_out.p;
+    for (int oc = 0; oc < d.out_ch; oc++) {
+        const float m_scale =
+            input.scale * layer.weight_scales[oc] * layer.bn_gain[oc];
+        const float bias = layer.bn_bias[oc];
+        const int32_t correction = input.zero_point * layer.weight_sums[oc];
+        float* dst = out.data.data() + (size_t)oc * d.m;
+        for (int pix = 0; pix < d.m; pix++) {
+            const int32_t acc = c[(size_t)pix * plan.n + oc] - correction;
+            float value = m_scale * (float)acc + bias;
             if (apply_silu) value = silu_host(value);
             dst[pix] = value;
         }

@@ -12,6 +12,7 @@
 
 #include "gemm.cuh"
 #include "gemm_reference.cuh"
+#include "igemm.cuh"
 
 #include <cmath>
 #include <cstdio>
@@ -250,6 +251,97 @@ bool check_shape(const Shape& s, double* out_gflops, double* out_ms) {
     return ok;
 }
 
+// The INT8 kernel gets no tolerance: int32 accumulation is exact, so any
+// difference from a host reference is a bug, not rounding. That makes this a
+// far sharper localizer than an end-to-end dump diff.
+bool check_shape_int8(const Shape& s, double* out_ms) {
+    const IgemmTile tile = igemm_choose_tile(s.n);
+    const IgemmTileShape ts = igemm_tile_shape(tile);
+
+    const int mp = round_up(s.m, ts.bm);
+    const int np = round_up(s.n, ts.bn);
+    const int kp = s.k;  // a multiple of 16, so kp/4 always divides bk4
+    const int k4 = kp / 4;
+
+    std::vector<signed char> hA((size_t)mp * kp, 0);
+    std::vector<signed char> hB((size_t)k4 * np * 4, 0);
+
+    for (int m = 0; m < s.m; m++) {
+        for (int k = 0; k < kp; k++) {
+            hA[(size_t)m * kp + k] =
+                (signed char)(int)(value_at((unsigned)(m * 31 + k * 7)) * 127.0f);
+        }
+    }
+    for (int k = 0; k < kp; k++) {
+        for (int n = 0; n < s.n; n++) {
+            hB[((size_t)(k / 4) * np + n) * 4 + (k % 4)] =
+                (signed char)(int)(value_at((unsigned)(k * 17 + n * 3 + 11)) * 127.0f);
+        }
+    }
+
+    void *dA, *dB, *dC;
+    CUDA_OK(cudaMalloc(&dA, hA.size()));
+    CUDA_OK(cudaMalloc(&dB, hB.size()));
+    CUDA_OK(cudaMalloc(&dC, (size_t)mp * np * sizeof(int)));
+    CUDA_OK(cudaMemcpy(dA, hA.data(), hA.size(), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(dB, hB.data(), hB.size(), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemset(dC, 0, (size_t)mp * np * sizeof(int)));
+
+    igemm_launch(tile, mp, np, k4, (const int*)dA, (const int*)dB, (int*)dC, nullptr);
+    CUDA_OK(cudaDeviceSynchronize());
+    CUDA_OK(cudaGetLastError());
+
+    std::vector<int> hC((size_t)mp * np);
+    CUDA_OK(cudaMemcpy(hC.data(), dC, hC.size() * sizeof(int), cudaMemcpyDeviceToHost));
+
+    int mismatches = 0;
+    long long worst_acc = 0;
+    const int samples = 2048;
+    for (int t = 0; t < samples; t++) {
+        const unsigned h = (unsigned)t * 2246822519u;
+        const int m = (int)((h >> 8) % (unsigned)s.m);
+        const int n = (int)((h >> 3) % (unsigned)s.n);
+
+        int ref = 0;
+        for (int k = 0; k < kp; k++) {
+            ref += (int)hA[(size_t)m * kp + k] *
+                   (int)hB[((size_t)(k / 4) * np + n) * 4 + (k % 4)];
+        }
+        if (std::abs(ref) > worst_acc) worst_acc = std::abs(ref);
+        if (hC[(size_t)m * np + n] != ref) mismatches++;
+    }
+
+    cudaEvent_t start, stop;
+    CUDA_OK(cudaEventCreate(&start));
+    CUDA_OK(cudaEventCreate(&stop));
+    const int runs = 20;
+    igemm_launch(tile, mp, np, k4, (const int*)dA, (const int*)dB, (int*)dC, nullptr);
+    CUDA_OK(cudaDeviceSynchronize());
+    CUDA_OK(cudaEventRecord(start));
+    for (int r = 0; r < runs; r++)
+        igemm_launch(tile, mp, np, k4, (const int*)dA, (const int*)dB, (int*)dC, nullptr);
+    CUDA_OK(cudaEventRecord(stop));
+    CUDA_OK(cudaEventSynchronize(stop));
+    float ms = 0.0f;
+    CUDA_OK(cudaEventElapsedTime(&ms, start, stop));
+    ms /= runs;
+    *out_ms = ms;
+
+    const double useful = 2.0 * s.m * s.n * s.k;
+    const int blocks = (np / ts.bn) * (mp / ts.bm);
+    std::printf("  %7d %5d %6d %2d  %3dx%-3d %5d  %7.3f %7.1f  %10lld %s\n",
+                s.m, s.n, s.k, s.layers, ts.bm, ts.bn, blocks, ms,
+                (useful / 1e9) / (ms / 1000.0), worst_acc,
+                mismatches ? "MISMATCH" : "");
+
+    CUDA_OK(cudaEventDestroy(start));
+    CUDA_OK(cudaEventDestroy(stop));
+    cudaFree(dA);
+    cudaFree(dB);
+    cudaFree(dC);
+    return mismatches == 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -311,6 +403,19 @@ int main(int argc, char** argv) {
                 padded_gmac, 100.0 * (padded_gmac / kModelGmac - 1.0));
     std::printf("  for reference: AVX-VNNI on one laptop core is 233.5 ms,\n");
     std::printf("  PyTorch FP32 on a T4 is 8.0 ms, TensorRT INT8 on a T4 is 4.9 ms\n");
+
+    std::printf("\n=== the same shapes through the INT8 dp4a kernel ===\n");
+    std::printf("  %7s %5s %6s %2s  %7s %5s  %7s %7s  %10s\n", "M", "N", "K", "x",
+                "tile", "blocks", "ms", "GOPS", "max|acc|");
+    double int8_ms = 0.0;
+    for (int i = 0; i < kNumShapes; i++) {
+        double ms = 0.0;
+        if (!check_shape_int8(kShapes[i], &ms)) ok = false;
+        int8_ms += ms * kShapes[i].layers;
+    }
+    std::printf("\n  INT8 GEMM time for one image: %.2f ms\n", int8_ms);
+    std::printf("  %.3f GMAC at %.0f GMAC/s, versus %.2f ms for the FP32 path\n",
+                kModelGmac, kModelGmac / (int8_ms / 1000.0), image_ms);
 
     std::printf("\n%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

@@ -303,6 +303,9 @@ FloatTensor conv2d_real(const Tensor& input, const Layer& layer, bool apply_silu
     if (g_kernel == Kernel::CudaFp32 && layer.cuda_slot >= 0) {
         return conv_cuda_fp32(input, layer, apply_silu);
     }
+    if (g_kernel == Kernel::CudaInt8 && layer.cuda_slot >= 0) {
+        return conv_cuda_int8(input, layer, apply_silu);
+    }
 #endif
     if ((g_kernel == Kernel::ScalarFp32 || g_kernel == Kernel::CudaFp32) &&
         !layer.weights_fp32.empty()) {

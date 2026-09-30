@@ -123,7 +123,8 @@ struct Detection {
 //   ScalarFp32  the same loop in FP32, as an arithmetic-width baseline
 //   VnniInt8    INT8 through AVX-VNNI, 32 multiply-accumulates per instruction
 //   CudaFp32    im2col plus an FP32 GEMM on the GPU
-enum class Kernel { ScalarInt8, ScalarFp32, VnniInt8, CudaFp32 };
+//   CudaInt8    im2col plus an INT8 GEMM on the GPU, dp4a for the dot product
+enum class Kernel { ScalarInt8, ScalarFp32, VnniInt8, CudaFp32, CudaInt8 };
 
 const char* kernel_name(Kernel k);
 bool parse_kernel(const std::string& name, Kernel& out);

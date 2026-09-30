@@ -22,6 +22,7 @@ void cuda_release();
 // BatchNorm affine and optional SiLU already applied, so conv2d_quant needs no
 // changes.
 FloatTensor conv_cuda_fp32(const Tensor& input, const Layer& layer, bool apply_silu);
+FloatTensor conv_cuda_int8(const Tensor& input, const Layer& layer, bool apply_silu);
 
 // Phase timing. Off by default: it synchronizes per phase per layer, which
 // serializes the pipeline and inflates the end-to-end number.

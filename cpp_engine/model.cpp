@@ -166,6 +166,7 @@ const char* kernel_name(Kernel k) {
         case Kernel::ScalarFp32: return "scalar-fp32";
         case Kernel::VnniInt8:   return "vnni-int8";
         case Kernel::CudaFp32:   return "cuda-fp32";
+        case Kernel::CudaInt8:   return "cuda-int8";
     }
     return "unknown";
 }
@@ -175,6 +176,7 @@ bool parse_kernel(const std::string& name, Kernel& out) {
     if (name == "scalar-fp32" || name == "fp32") { out = Kernel::ScalarFp32; return true; }
     if (name == "vnni-int8"   || name == "vnni") { out = Kernel::VnniInt8;   return true; }
     if (name == "cuda-fp32"   || name == "cuda32") { out = Kernel::CudaFp32; return true; }
+    if (name == "cuda-int8"   || name == "cuda") { out = Kernel::CudaInt8; return true; }
     return false;
 }
 
@@ -226,7 +228,12 @@ void prepare_kernel(Model& model, Kernel k) {
 
         // VnniInt8: repack [oc][ic][kh][kw] -> [oc][kh][kw][ic_padded].
         if (!layer.weights_hwc.empty()) continue;
-        if (ic < kMinVnniChannels) continue;  // left on the scalar kernel
+        // VNNI leaves thin layers on the scalar kernel, which costs little
+        // there. On the GPU it would drop layer 0 onto a 1.1 GMAC/s loop
+        // and cost about 40 ms, so the CUDA path packs it and eats the
+        // padding: ic 3 -> 16 makes its K 144 instead of 27, which is 5.3x
+        // the work on a layer worth 1.1% of the model.
+        if (ic < kMinVnniChannels && k != Kernel::CudaInt8) continue;
 
         const int icp = round_up(ic, kChannelAlign);
         layer.ic_padded = icp;
@@ -254,7 +261,7 @@ void prepare_kernel(Model& model, Kernel k) {
     }
 
 #if ENGINE_HAS_CUDA
-    if (k == Kernel::CudaFp32) {
+    if (k == Kernel::CudaFp32 || k == Kernel::CudaInt8) {
         std::cout << "CUDA device: " << cuda_device_summary() << std::endl;
         cuda_prepare_layers(model, k);
     }

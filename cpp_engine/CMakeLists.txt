@@ -52,6 +52,7 @@ if(ENGINE_CUDA)
   target_sources(custom_engine PRIVATE
     cuda/device_probe.cu
     cuda/gemm.cu
+    cuda/igemm.cu
     cuda/conv_cuda.cu
   )
   target_compile_definitions(custom_engine PRIVATE ENGINE_HAS_CUDA=1)
@@ -66,6 +67,7 @@ if(ENGINE_CUDA)
   add_executable(gemm_selftest
     cuda/gemm_selftest.cu
     cuda/gemm.cu
+    cuda/igemm.cu
     cuda/gemm_reference.cu
   )
   target_include_directories(gemm_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
