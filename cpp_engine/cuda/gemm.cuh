@@ -88,13 +88,19 @@ __global__ void sgemm_tiled(int M, int N, int K, float alpha,
         __syncthreads();
     }
 
+    // The source always read C to form beta*C, which at beta == 0 still
+    // touches uninitialized memory -- and 0.0f * NaN is NaN. if constexpr
+    // rather than a ternary: the ternary kept the C address live and pushed
+    // this to 130 registers, and at 256 threads anything over 128 costs half
+    // the resident blocks on a T4.
     for (int resIdxM = 0; resIdxM < TM; ++resIdxM) {
         for (int resIdxN = 0; resIdxN < TN; ++resIdxN) {
-            float* dst = &C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN];
-            const float acc = alpha * threadResults[resIdxM * TN + resIdxN];
-            // The source always read C to form beta*C, which with beta == 0
-            // still touches uninitialized memory -- and 0.0f * NaN is NaN.
-            *dst = BETA_ZERO ? acc : acc + beta * (*dst);
+            const int idx = (threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN;
+            if constexpr (BETA_ZERO) {
+                C[idx] = alpha * threadResults[resIdxM * TN + resIdxN];
+            } else {
+                C[idx] = alpha * threadResults[resIdxM * TN + resIdxN] + beta * C[idx];
+            }
         }
     }
 }
@@ -104,18 +110,20 @@ __global__ void sgemm_tiled(int M, int N, int K, float alpha,
 // N=64 -- so the narrow configs are the ones that matter, not the 128x128 the
 // kernel was originally tuned for.
 //
-// The narrow tiles also win on occupancy, which was not the reason for adding
-// them but is the larger effect. Per ptxas for sm_75, against the T4's 65536
-// registers and 64 KB of shared memory per SM:
+// The narrow tiles also help occupancy. Per ptxas for sm_75, against the T4's
+// 65536 registers and 64 KB of shared memory per SM:
 //
-//   N128  130 reg,  8 KB smem, 256 thr -> 1 block/SM,  8 warps, 25%
+//   N128  128 reg,  8 KB smem, 256 thr -> 2 blocks/SM, 16 warps, 50%
 //   N64   106 reg, 12 KB smem, 256 thr -> 2 blocks/SM, 16 warps, 50%
 //   N32    72 reg,  6 KB smem, 128 thr -> 7 blocks/SM, 28 warps, 87.5%
 //
-// 2D register tiling is deliberately register-hungry -- it trades occupancy
-// for instruction-level parallelism -- so 25% is not a defect at 128x128. It
-// does mean the layers routed to N64 get both half the padding and twice the
-// resident warps.
+// 128 registers at 256 threads is exactly half the register file, so N128 sits
+// right on the edge of fitting two blocks. Two registers more and it drops to
+// one block and loses about 10% -- measured, not hypothetical, which is why
+// the epilogue below uses if constexpr.
+//
+// 2D register tiling trades occupancy for instruction-level parallelism, so
+// 50% is where this kernel wants to be, not a shortfall.
 enum class GemmTile { N32, N64, N128 };
 
 struct GemmTileShape {

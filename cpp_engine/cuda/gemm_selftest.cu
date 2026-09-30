@@ -32,20 +32,25 @@ namespace {
     } while (0)
 
 // The GEMM shape of every convolution in the model, deduped. M is out_h*out_w,
-// N is out_ch, K is kh*kw*ic_padded.
+// N is out_ch, K is kh*kw*ic_padded, and layers is how many of the 63
+// convolutions have this shape -- which is what turns per-shape timings into a
+// per-image projection.
 struct Shape {
-    int m, n, k;
+    int m, n, k, layers;
 };
 
 const Shape kShapes[] = {
-    {400, 2, 64},       {400, 64, 64},      {400, 64, 576},     {400, 64, 2304},
-    {400, 128, 256},    {400, 128, 1152},   {400, 256, 256},    {400, 256, 384},
-    {400, 256, 512},    {400, 256, 1152},   {1600, 2, 64},      {1600, 64, 64},
-    {1600, 64, 576},    {1600, 64, 1152},   {1600, 128, 128},   {1600, 128, 192},
-    {1600, 128, 256},   {1600, 128, 384},   {1600, 128, 576},   {6400, 2, 64},
-    {6400, 32, 288},    {6400, 64, 64},     {6400, 64, 96},     {6400, 64, 128},
-    {6400, 64, 192},    {6400, 64, 288},    {6400, 64, 576},    {25600, 16, 144},
-    {25600, 32, 32},    {25600, 32, 48},    {25600, 32, 144},   {102400, 16, 144},
+    {400, 2, 64, 1},      {400, 64, 64, 1},     {400, 64, 576, 2},
+    {400, 64, 2304, 2},   {400, 128, 256, 1},   {400, 128, 1152, 5},
+    {400, 256, 256, 1},   {400, 256, 384, 3},   {400, 256, 512, 1},
+    {400, 256, 1152, 1},  {1600, 2, 64, 1},     {1600, 64, 64, 1},
+    {1600, 64, 576, 11},  {1600, 64, 1152, 2},  {1600, 128, 128, 1},
+    {1600, 128, 192, 3},  {1600, 128, 256, 1},  {1600, 128, 384, 1},
+    {1600, 128, 576, 1},  {6400, 2, 64, 1},     {6400, 32, 288, 6},
+    {6400, 64, 64, 2},    {6400, 64, 96, 1},    {6400, 64, 128, 1},
+    {6400, 64, 192, 1},   {6400, 64, 288, 1},   {6400, 64, 576, 4},
+    {25600, 16, 144, 2},  {25600, 32, 32, 1},   {25600, 32, 48, 1},
+    {25600, 32, 144, 1},  {102400, 16, 144, 1},
 };
 constexpr int kNumShapes = static_cast<int>(sizeof(kShapes) / sizeof(kShapes[0]));
 
@@ -134,7 +139,7 @@ bool check_4096() {
 // Reference dot products for a sample of output positions. A full host GEMM
 // over every shape would take minutes and prove nothing extra; a spread of
 // sampled positions catches an indexing error just as well.
-bool check_shape(const Shape& s, double* out_gflops) {
+bool check_shape(const Shape& s, double* out_gflops, double* out_ms) {
     const GemmTile tile = gemm_choose_tile(s.n);
     const GemmTileShape ts = gemm_tile_shape(tile);
 
@@ -177,6 +182,7 @@ bool check_shape(const Shape& s, double* out_gflops) {
     std::vector<float> hC(static_cast<size_t>(mp) * np);
     CUDA_OK(cudaMemcpy(hC.data(), dC, bytes_c, cudaMemcpyDeviceToHost));
 
+    double worst_abs = 0.0;
     double worst_rel = 0.0;
     const int samples = 2048;
     for (int t = 0; t < samples; t++) {
@@ -190,10 +196,21 @@ bool check_shape(const Shape& s, double* out_gflops) {
                    static_cast<double>(hB[static_cast<size_t>(k) * np + n]);
         }
         const double got = hC[static_cast<size_t>(m) * np + n];
-        const double denom = std::fabs(ref) > 1e-6 ? std::fabs(ref) : 1.0;
-        const double rel = std::fabs(got - ref) / denom;
-        if (rel > worst_rel) worst_rel = rel;
+        const double abs_err = std::fabs(got - ref);
+        if (abs_err > worst_abs) worst_abs = abs_err;
+        if (std::fabs(ref) > 1e-3) {
+            const double rel = abs_err / std::fabs(ref);
+            if (rel > worst_rel) worst_rel = rel;
+        }
     }
+
+    // Gate on absolute error, not relative. The inputs are in [-1, 1], so a
+    // K-term sum accumulates at most about K * FLT_EPSILON of rounding; the
+    // factor of 8 is slack. Relative error is the wrong gate here because a
+    // dot product of random signs lands near zero often enough that a
+    // perfectly good answer shows a huge ratio -- which is exactly what an
+    // earlier 1e-4 relative threshold flagged on 29 of these 32 shapes.
+    const double atol = 8.0 * s.k * 1.1920929e-7;
 
     cudaEvent_t start, stop;
     CUDA_OK(cudaEventCreate(&start));
@@ -214,15 +231,16 @@ bool check_shape(const Shape& s, double* out_gflops) {
     // overhead, so counting it would flatter the number.
     const double useful = 2.0 * s.m * s.n * s.k;
     *out_gflops = (useful / 1e9) / (ms / 1000.0);
+    *out_ms = ms;
 
     const int blocks = ((np + ts.bn - 1) / ts.bn) * ((mp + ts.bm - 1) / ts.bm);
     const double pad_mult = (static_cast<double>(mp) * np * kp) /
                             (static_cast<double>(s.m) * s.n * s.k);
 
-    const bool ok = worst_rel < 1e-4;
-    std::printf("  %7d %5d %6d  %3dx%-3d %6d  %8.3f ms %8.1f GF  %5.2fx %7.1e %s\n",
-                s.m, s.n, s.k, ts.bm, ts.bn, blocks, ms, *out_gflops, pad_mult,
-                worst_rel, ok ? "" : "FAIL");
+    const bool ok = worst_abs <= atol;
+    std::printf("  %7d %5d %6d %2d  %3dx%-3d %5d  %7.3f %7.1f  %5.2fx %8.1e %8.1e %s\n",
+                s.m, s.n, s.k, s.layers, ts.bm, ts.bn, blocks, ms, *out_gflops,
+                pad_mult, worst_abs, worst_rel, ok ? "" : "FAIL");
 
     CUDA_OK(cudaEventDestroy(start));
     CUDA_OK(cudaEventDestroy(stop));
@@ -260,16 +278,30 @@ int main(int argc, char** argv) {
     }
 
     std::printf("=== the network's 32 distinct shapes ===\n");
-    std::printf("  %7s %5s %6s  %7s %6s  %11s %11s  %5s %7s\n",
-                "M", "N", "K", "tile", "blocks", "time", "useful", "pad", "rel");
-    double sum_gflops = 0.0;
+    std::printf("  %7s %5s %6s %2s  %7s %5s  %7s %7s  %5s %8s %8s\n",
+                "M", "N", "K", "x", "tile", "blocks", "ms", "GFLOPS", "pad",
+                "abs", "rel");
+
+    double image_ms = 0.0;
+    double image_flop = 0.0;
+    int layers = 0;
     for (int i = 0; i < kNumShapes; i++) {
-        double gflops = 0.0;
-        if (!check_shape(kShapes[i], &gflops)) ok = false;
-        sum_gflops += gflops;
+        double gflops = 0.0, ms = 0.0;
+        if (!check_shape(kShapes[i], &gflops, &ms)) ok = false;
+        image_ms += ms * kShapes[i].layers;
+        image_flop += 2.0 * kShapes[i].m * kShapes[i].n * kShapes[i].k * kShapes[i].layers;
+        layers += kShapes[i].layers;
     }
-    std::printf("\n  mean %.1f GFLOPS across %d shapes\n",
-                sum_gflops / kNumShapes, kNumShapes);
+
+    // Weighted by how many layers share each shape, so this is the GEMM cost
+    // of one forward pass -- not an average over shapes, which would count a
+    // shape used once as heavily as one used eleven times.
+    std::printf("\n  GEMM time for one image: %.2f ms over %d convolutions\n",
+                image_ms, layers);
+    std::printf("  %.3f GMAC at %.0f GMAC/s effective\n", image_flop / 2e9,
+                (image_flop / 2e9) / (image_ms / 1000.0));
+    std::printf("  for reference: AVX-VNNI on one laptop core is 233.5 ms,\n");
+    std::printf("  PyTorch FP32 on a T4 is 8.0 ms, TensorRT INT8 on a T4 is 4.9 ms\n");
 
     std::printf("\n%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
