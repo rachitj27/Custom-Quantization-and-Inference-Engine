@@ -74,7 +74,8 @@ def main():
     if only_a or only_b:
         print("layer sets differ -- only in a: {}, only in b: {}".format(only_a, only_b))
 
-    print("{:<6} {:>10} {:>10} {:>10} {:>6}".format("Layer", "N", "exact", "differing", "max"))
+    print("{:<6} {:>10} {:>10} {:>10} {:>6} {:>9}".format(
+        "Layer", "N", "exact", "differing", "max", "bias"))
 
     failures = []
     shared = sorted(set(index_a) & set(index_b))
@@ -89,14 +90,20 @@ def main():
             continue
 
         # int16 so the subtraction cannot wrap at the int8 boundary.
-        d = np.abs(a.astype(np.int16) - b.astype(np.int16))
+        signed = a.astype(np.int16) - b.astype(np.int16)
+        d = np.abs(signed)
         n_diff = int((d != 0).sum())
         worst = int(d.max()) if d.size else 0
         bad = worst > args.max_abs_diff
 
-        print("{:<6} {:>10} {:>9.4f}% {:>10} {:>6}  {}".format(
+        # Mean signed difference separates rounding from a real error. Reduction
+        # order that rounds differently scatters symmetrically about zero; a
+        # wrong scale, a missing bias or a bad index pulls the mean off it.
+        bias = float(signed.mean())
+
+        print("{:<6} {:>10} {:>9.4f}% {:>10} {:>6} {:>+9.5f}  {}".format(
             "L{:02d}".format(i), a.size, 100.0 * float((d == 0).mean()), n_diff, worst,
-            "FAIL" if bad else ""))
+            bias, "FAIL" if bad else ""))
         if bad:
             failures.append(i)
 

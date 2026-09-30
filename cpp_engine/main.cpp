@@ -26,6 +26,10 @@
 #include "model.h"
 #include "ops.h"
 
+#if ENGINE_HAS_CUDA
+#include "cuda/conv_cuda.h"
+#endif
+
 namespace {
 
 constexpr int kNetSize = 640;
@@ -42,6 +46,7 @@ struct Options {
     float conf = 0.25f;
     float iou = 0.45f;
     int bench = 0;
+    bool cuda_profile = false;
     Kernel kernel = Kernel::VnniInt8;
 };
 
@@ -99,6 +104,7 @@ void print_usage() {
         "      --input-bin <path>  use a pre-quantized 3x640x640 INT8 input\n"
         "      --dump-dir <dir>    write each layer's INT8 output for validation\n"
         "      --bench <n>         run the forward pass n extra times and report timing\n"
+        "      --cuda-profile      break the CUDA path down by phase\n"
         "      --kernel <name>     convolution kernel (default vnni-int8):\n"
         "                            scalar-int8  one INT8 multiply at a time\n"
         "                            scalar-fp32  the same loop in FP32\n"
@@ -124,6 +130,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--csv") o.csv = next("--csv");
         else if (a == "--csv-append") { o.csv = next("--csv-append"); o.csv_append = true; }
         else if (a == "--bench") o.bench = std::stoi(next("--bench"));
+        else if (a == "--cuda-profile") { o.cuda_profile = true; }
         else if (a == "--kernel") {
             const std::string name = next("--kernel");
             if (!parse_kernel(name, o.kernel)) {
@@ -238,11 +245,39 @@ int main(int argc, char** argv) {
             input = preprocess(image, kNetSize, model);
         }
 
+#if ENGINE_HAS_CUDA
+        // Off unless asked: it synchronizes per phase per layer, which
+        // serializes the pipeline and inflates the wall clock it is measuring.
+        if (opt.cuda_profile) {
+            cuda_profile_enable(true);
+            cuda_reset_phase_times();
+        }
+#endif
+
         const auto t0 = std::chrono::high_resolution_clock::now();
         auto features = run_backbone(model, *input);
         auto detections = detect_head(model, features, opt.conf, opt.iou);
         const auto t1 = std::chrono::high_resolution_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+#if ENGINE_HAS_CUDA
+        if (opt.cuda_profile) {
+            const CudaPhaseTimes p = cuda_phase_times();
+            const double gpu = p.h2d_ms + p.im2col_ms + p.gemm_ms + p.d2h_ms + p.epilogue_ms;
+            std::cout << "\n=== CUDA phases, one image ===\n" << std::fixed
+                      << std::setprecision(2)
+                      << "  H2D       " << p.h2d_ms << " ms\n"
+                      << "  im2col    " << p.im2col_ms << " ms\n"
+                      << "  GEMM      " << p.gemm_ms << " ms\n"
+                      << "  D2H       " << p.d2h_ms << " ms\n"
+                      << "  epilogue  " << p.epilogue_ms << " ms  (host: bn affine, SiLU, transpose)\n"
+                      << "  measured  " << gpu << " ms of " << ms << " ms total\n"
+                      << "  rest      " << (ms - gpu)
+                      << " ms  (requantize, concat, maxpool, upsample, DFL, NMS)\n"
+                      << "  launches  " << p.launches << "\n";
+            cuda_profile_enable(false);
+        }
+#endif
 
         if (!opt.dump_dir.empty()) {
             dump_layers(features, opt.dump_dir);
