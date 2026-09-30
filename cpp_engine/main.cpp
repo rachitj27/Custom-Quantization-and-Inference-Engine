@@ -102,6 +102,7 @@ void print_usage() {
         "                            scalar-int8  one INT8 multiply at a time\n"
         "                            scalar-fp32  the same loop in FP32\n"
         "                            vnni-int8    INT8 via AVX-VNNI, 32 per instruction\n"
+        "                            cuda-fp32    im2col plus an FP32 GEMM on the GPU\n"
         "      --model-json <path> / --model-bin <path>\n";
 }
 
@@ -200,6 +201,11 @@ int main(int argc, char** argv) {
             std::cerr << "This CPU has no AVX-VNNI; falling back to scalar-int8"
                       << std::endl;
             opt.kernel = Kernel::ScalarInt8;
+        }
+        if (opt.kernel == Kernel::CudaFp32 && !cuda_supported()) {
+            std::cerr << "No usable CUDA device; falling back to scalar-fp32"
+                      << std::endl;
+            opt.kernel = Kernel::ScalarFp32;
         }
         prepare_kernel(model, opt.kernel);
         set_kernel(opt.kernel);

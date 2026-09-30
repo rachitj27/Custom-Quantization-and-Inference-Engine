@@ -34,6 +34,10 @@ target_link_libraries(custom_engine PRIVATE nlohmann_json::nlohmann_json)
 set_source_files_properties(image_io.cpp PROPERTIES COMPILE_FLAGS
   "-Wno-unused-but-set-variable -Wno-missing-field-initializers")
 
+if(NOT ENGINE_CUDA)
+  target_compile_definitions(custom_engine PRIVATE ENGINE_HAS_CUDA=0)
+endif()
+
 if(ENGINE_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
@@ -48,6 +52,7 @@ if(ENGINE_CUDA)
   target_sources(custom_engine PRIVATE
     cuda/device_probe.cu
     cuda/gemm.cu
+    cuda/conv_cuda.cu
   )
   target_compile_definitions(custom_engine PRIVATE ENGINE_HAS_CUDA=1)
 
