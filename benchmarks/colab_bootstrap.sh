@@ -15,8 +15,8 @@
 set -euo pipefail
 
 BRANCH="${1:-cuda-gemm-speedup}"
-REPO="https://github.com/rachitj27/Custom-Quantization-and-Inference-Engine-.git"
-ASSET_URL="https://github.com/rachitj27/Custom-Quantization-and-Inference-Engine-/releases/download/engine-assets-v1/engine-assets.tar.gz"
+REPO="https://github.com/rachitj27/Custom-Quantization-and-Inference-Engine.git"
+ASSET_URL="https://github.com/rachitj27/Custom-Quantization-and-Inference-Engine/releases/download/engine-assets-v1/engine-assets.tar.gz"
 UPSTREAM="https://github.com/Abonia1/YOLOv8-Fire-and-Smoke-Detection.git"
 
 ENGINE_DIR=/content/engine
