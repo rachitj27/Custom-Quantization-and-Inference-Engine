@@ -44,7 +44,16 @@ Red for fire, blue for smoke, with the class and confidence drawn on the box. Bo
 - The detection head, including the distribution based box decoding and removal of overlapping boxes
 - JPEG in, annotated JPEG out
 
-**M4, hardware accelerator.** An FPGA implementation in Verilog. Planned.
+**M4, GPU acceleration.** Restructured the convolution as a matrix multiply and put it on my own CUDA kernel.
+
+- im2col on the device, laid out in the same order the vectorized CPU kernel already packed its weights in
+- The 2D register-tiled GEMM from [cuda-gemm-from-scratch](https://github.com/rachitj27/cuda-gemm-from-scratch), generalized from one square shape to the 32 this network produces, with three tile configurations because the output channel count never exceeds 256
+- An INT8 version of it using `__dp4a`, the GPU's four-way 8 bit dot product, which is byte for byte identical to the CPU 8 bit kernel across all 22 layer dumps
+- The requantization arithmetic fused into the kernel's epilogue, which is what actually made the engine faster
+
+62 milliseconds against 234 for the vectorized CPU kernel, at the same accuracy. The convolution itself went from 17.3 to 1588 million multiply-accumulates per second, 92 times, but that is not where the 3.8x came from -- see below.
+
+**M5, hardware accelerator.** An FPGA implementation in Verilog. Planned.
 
 ## Results
 
@@ -64,11 +73,22 @@ The vectorized kernel described below scores exactly the same 0.8826, because it
 
 ## Speed
 
-The engine runs three convolution kernels, picked with `--kernel`. They compute the same thing and differ only in how the arithmetic is issued.
+The engine runs six convolution kernels, picked with `--kernel`. They compute the same thing and differ in how, and where, the arithmetic is issued.
+
+| `--kernel` | Where | Latency |
+|---|---|---|
+| `scalar-int8` | CPU, one multiply at a time | 3579 ms |
+| `scalar-fp32` | CPU, the same loop in FP32 | 3106 ms |
+| `vnni-int8` | CPU, AVX-VNNI, 32 MACs per instruction | 234 ms |
+| `cuda-fp32` | GPU, im2col plus an FP32 GEMM | 295 ms |
+| `cuda-int8` | GPU, INT8 GEMM via `__dp4a` | 290 ms |
+| `cuda-int8-fused` | the same, epilogue on the GPU too | **62 ms** |
+
+CPU rows on a Core Ultra 7 256V, GPU rows on a Colab T4.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/speedup-dark.png">
-  <img alt="Two bar charts. The first shows the engine's three kernels, where the vectorized 8 bit kernel takes 234 milliseconds against 3579 for the plain 8 bit loop and 3106 for the plain 32 bit loop, a 15x gain. The second places the engine against production runtimes on a log scale, where OpenVINO in 8 bit takes 13.9 milliseconds, ONNX Runtime in 32 bit takes 24.1 and PyTorch in 32 bit takes 42.4." src="docs/speedup-light.png">
+  <img alt="Two bar charts. The first shows the engine's four kernels, where the fused CUDA 8 bit kernel takes 62 milliseconds against 234 for the vectorized AVX-VNNI kernel, 3579 for the plain 8 bit loop and 3106 for the plain 32 bit loop, a 3.8x gain over the vectorized CPU kernel. The second places the engine against production runtimes on a log scale, where the CUDA kernel at 62 milliseconds sits between PyTorch in 32 bit at 42.4 and the engine's own vectorized kernel at 234, with OpenVINO in 8 bit at 13.9 and TensorRT in 8 bit at 4.9." src="docs/speedup-light.png">
 </picture>
 
 | Kernel | What it does | Best latency | mAP@0.5 |
@@ -116,15 +136,27 @@ The weights are 8 bit, stored and loaded as raw bytes and never converted to flo
 
 The conversion between layers is floating point, and so is the detection head. The head is deliberate. Box coordinates run from 0 to 640 while confidence scores run from 0 to 1, and a single 8 bit scale cannot represent both, so decoding stays in full precision.
 
+## Where the time actually went
+
+This is the part worth reading, because it was not what I expected.
+
+Convolution was the whole runtime. 4.04 billion multiply-accumulates per image, and the plain loop got through 1.1 billion per second, the vectorized one 17.3 billion. So the GPU work was aimed squarely at the convolution, and it worked: the INT8 GEMM does 1588 billion per second, which is 92 times the vectorized CPU kernel.
+
+The engine got no faster. 290 milliseconds against 234 for the CPU.
+
+Profiling the phases explains it. Of that 290 ms, the GEMM was 2.6 and the transfers about 12. The other 273 was the CPU: the floating point epilogue that turns 32 bit accumulators back into real numbers, the requantization back to 8 bit, and then the concat, pooling, upsample, box decoding and overlap removal. None of that is convolution, so making convolution 92 times faster could not touch it. It had simply been invisible while convolution took three and a half seconds.
+
+Fusing the epilogue and the requantization into the kernel is what produced the speedup, taking 290 ms to 62. The transfer back to the host shrank fourfold with it, because the copy now carries 8 bit values rather than 32 bit accumulators.
+
+The lesson is the ordinary one about Amdahl's law, but it is much sharper when you have measured both halves yourself: a 92x kernel bought a 3.8x engine, and only after moving the work that was never the point.
+
 ## What is next
 
-Writing CUDA GEMM kernels to make the engine fast on a GPU.
+Two things are left on the CPU and they are now the floor: 47 of the remaining 62 milliseconds is concat, pooling, upsample, box decoding and overlap removal, all single threaded. Keeping activations resident on the device across layers would remove the per-layer round trip entirely, which is the larger structural change and the honest next step.
 
-The vectorization above was the first half of that work. Reaching the 8 bit instruction meant laying the data out so the numbers being multiplied together sit next to each other, and that is the same layout a matrix multiply wants. What is left is restructuring the convolution as a proper matrix multiply, then writing the GPU kernels for it.
+Accuracy is protected throughout. Layer by layer comparison against PyTorch plus end to end scoring over the test set means any kernel that breaks correctness shows up immediately rather than several stages later. `cuda-int8` came out byte for byte identical to the CPU 8 bit kernel on all 9,420,800 values in the layer dumps, which is provable rather than approximate because integer accumulation is exact regardless of the order it happens in.
 
-The model needs 4.04 billion multiply accumulates per image. The plain loop got through 1.1 billion of them per second. The vectorized one manages 17.3 billion per second. Threading it across the other seven cores is the obvious next gain on the CPU, and a GPU should move it by a larger factor again.
-
-Accuracy is protected while that happens. Layer by layer comparison against PyTorch plus end to end scoring over the test set means any kernel that breaks correctness shows up immediately rather than several stages later. The vectorized kernel was the first real test of that, and it came out byte for byte identical.
+The fused kernel gives that up deliberately and says so: CUDA's `expf` is not the C library's, and one unit in the last place is enough to flip a rounding decision during requantization. It differs by at most 3 codes on 3 of the 22 layers and moves no detection, so mAP is unchanged, but the exact path is kept available rather than replaced.
 
 ## Reproducing
 
@@ -148,10 +180,34 @@ cd cpp_engine/build
 
 Requires `cmake`, a C++17 compiler and `nlohmann-json`. Image handling uses [stb](https://github.com/nothings/stb), included in `cpp_engine/third_party/`.
 
+The CUDA kernels are off by default, so none of the above needs a GPU. To build them:
+
+```bash
+cmake -S cpp_engine -B cpp_engine/build-cuda -DENGINE_CUDA=ON
+cmake --build cpp_engine/build-cuda -j
+
+./cpp_engine/build-cuda/gemm_selftest    # kernels alone, against exact references
+./cpp_engine/build-cuda/custom_engine --input-bin test_input.bin     --kernel cuda-int8-fused --bench 3
+
+# the byte-exact check
+./cpp_engine/build-cuda/custom_engine --input-bin test_input.bin     --dump-dir dumps_cpu --kernel scalar-int8
+./cpp_engine/build-cuda/custom_engine --input-bin test_input.bin     --dump-dir dumps_gpu --kernel cuda-int8
+python quantization/compare_dumps.py --a dumps_cpu --b dumps_gpu
+```
+
+`nvcc` compiles without a GPU present, so the whole thing can be built and
+checked on a machine that cannot run it. `benchmarks/colab_bootstrap.sh` sets up
+a Colab T4 to run it, including the model files, which are too large for the
+repo and live in the `engine-assets-v1` release.
+
+CUDA 12.4 does not accept gcc 15 as a host compiler; pass
+`-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13` if that is your default.
+
 ## Layout
 
 - `quantization/`, the Python side. Conversion math, calibration, BatchNorm folding, and the two validation harnesses.
 - `cpp_engine/`, the engine. Tensor type, model loader, operators, detection head, image handling.
+- `cpp_engine/cuda/`, the GPU backend. The vendored GEMM, its INT8 counterpart, im2col and the fused epilogue.
 - `benchmarks/`, comparisons against PyTorch, ONNX Runtime, OpenVINO and TensorRT.
 
 ## Dataset

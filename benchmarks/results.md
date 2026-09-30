@@ -21,6 +21,58 @@ milliseconds per image. GPU rows, Colab Tesla T4. mAP is scored over the same
 | PyTorch (Ultralytics), T4 | FP32 | 8.0 ms | 8.1 ms | 0.8859 |
 | TensorRT, T4, default export | INT8 | 4.4 ms | 5.1 ms | 0.0833 |
 | TensorRT, T4, convolutions only | INT8 | 4.9 ms | 6.4 ms | 0.8656 |
+| Custom C++ engine, CUDA GEMM, T4 | FP32 arithmetic | 295.2 ms | 365.1 ms | 0.8826 |
+| Custom C++ engine, CUDA dp4a GEMM, T4 | INT8 | 290.4 ms | 290.4 ms | 0.8826 |
+| Custom C++ engine, CUDA dp4a GEMM fused, T4 | INT8 | 62.1 ms | 63.3 ms | 0.8826 |
+
+## What the GPU row does and does not measure
+
+The three CUDA rows share one kernel: a 2D register-tiled GEMM from
+[cuda-gemm-from-scratch](https://github.com/rachitj27/cuda-gemm-from-scratch),
+generalized to the shapes this network produces and then ported to INT8 with
+`__dp4a`. The convolution is genuinely fast, and for two of the three rows that
+barely shows up in the latency.
+
+| | GEMM per image | Rate | End to end |
+|---|---|---|---|
+| AVX-VNNI, one laptop core | 233.5 ms | 17.3 GMAC/s | 233.5 ms |
+| CUDA FP32 GEMM | 10.63 ms | 380 GMAC/s | 295.2 ms |
+| CUDA INT8 dp4a GEMM | 2.55 ms | 1588 GMAC/s | 290.4 ms |
+| CUDA INT8, epilogue fused | 2.55 ms | 1588 GMAC/s | 62.1 ms |
+
+Convolution was effectively the entire runtime before any of this. Making it 92
+times faster moved the end-to-end number by nothing at all, because the work
+around it -- the FP32 epilogue, requantization, and the concat, pooling,
+upsample, DFL decode and NMS -- was all still on the CPU. Measured on the
+unfused INT8 row, the GEMM was 0.9% of the wall clock.
+
+Fusing the epilogue and the requantization onto the device is what produced the
+speedup. It also shrinks the transfer back to the host fourfold, since the copy
+carries INT8 rather than int32 accumulators. Of the 69 ms in a profiled run,
+22 ms is on the GPU and 47 ms is what remains on the CPU.
+
+A note on the comparison: the 62.1 ms and the 233.5 ms come from different
+machines. The GPU rows run their host work on a Colab Xeon, which the same
+scalar kernel shows is about 2.85 times slower than the laptop the CPU rows
+were measured on, so the 3.8x is conservative rather than flattering.
+
+## Correctness
+
+`cuda-int8` is byte-for-byte identical to `scalar-int8` across all 22 layer
+dumps, 9,420,800 elements with zero differing, and reproduces mAP and both
+per-class APs exactly. `scalar-int8` was already verified identical to
+`vnni-int8`, so the GPU kernel matches the AVX-VNNI kernel. This is provable
+rather than approximate because int32 accumulation is exact and
+order-independent, and every floating-point operation stays on the host.
+
+`cuda-int8-fused` cannot make that claim and is not meant to. CUDA's `expf` is
+not glibc's, and one unit in the last place is enough to flip `lround` where a
+value sits on a requantization tie. It shows up as at most 3 INT8 codes on 3 of
+the 22 layers, with no bias, and it moves no detection across a threshold: mAP
+and both per-class APs are unchanged. The two paths are kept separate so the
+exact result stays available.
+
+`quantization/compare_dumps.py` is the gate for all of this and exits nonzero.
 
 ## What INT8 actually did to latency
 
