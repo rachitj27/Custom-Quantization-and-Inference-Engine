@@ -1,5 +1,9 @@
 #include "model.h"
 
+#if ENGINE_HAS_CUDA
+#include "cuda/conv_cuda.h"
+#endif
+
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -161,6 +165,9 @@ const char* kernel_name(Kernel k) {
         case Kernel::ScalarInt8: return "scalar-int8";
         case Kernel::ScalarFp32: return "scalar-fp32";
         case Kernel::VnniInt8:   return "vnni-int8";
+        case Kernel::CudaFp32:   return "cuda-fp32";
+        case Kernel::CudaInt8:   return "cuda-int8";
+        case Kernel::CudaInt8Fused: return "cuda-int8-fused";
     }
     return "unknown";
 }
@@ -169,7 +176,18 @@ bool parse_kernel(const std::string& name, Kernel& out) {
     if (name == "scalar-int8" || name == "int8") { out = Kernel::ScalarInt8; return true; }
     if (name == "scalar-fp32" || name == "fp32") { out = Kernel::ScalarFp32; return true; }
     if (name == "vnni-int8"   || name == "vnni") { out = Kernel::VnniInt8;   return true; }
+    if (name == "cuda-fp32"   || name == "cuda32") { out = Kernel::CudaFp32; return true; }
+    if (name == "cuda-int8"   || name == "cuda") { out = Kernel::CudaInt8; return true; }
+    if (name == "cuda-int8-fused" || name == "fused") { out = Kernel::CudaInt8Fused; return true; }
     return false;
+}
+
+bool cuda_supported() {
+#if ENGINE_HAS_CUDA
+    return cuda_available();
+#else
+    return false;
+#endif
 }
 
 bool vnni_supported() {
@@ -194,7 +212,7 @@ void prepare_kernel(Model& model, Kernel k) {
         const int8_t* w = layer.weights->data;
         const size_t per_oc = static_cast<size_t>(ic) * kh * kw;
 
-        if (k == Kernel::ScalarFp32) {
+        if (k == Kernel::ScalarFp32 || k == Kernel::CudaFp32) {
             if (!layer.weights_fp32.empty()) continue;
             layer.weights_fp32.resize(static_cast<size_t>(oc) * per_oc);
             // Dequantize with the same per-channel scale the INT8 path folds
@@ -212,7 +230,9 @@ void prepare_kernel(Model& model, Kernel k) {
 
         // VnniInt8: repack [oc][ic][kh][kw] -> [oc][kh][kw][ic_padded].
         if (!layer.weights_hwc.empty()) continue;
-        if (ic < kMinVnniChannels) continue;  // left on the scalar kernel
+        // CUDA packs thin layers too: leaving layer 0 scalar costs ~40 ms
+        if (ic < kMinVnniChannels && k != Kernel::CudaInt8 &&
+            k != Kernel::CudaInt8Fused) continue;
 
         const int icp = round_up(ic, kChannelAlign);
         layer.ic_padded = icp;
@@ -238,6 +258,14 @@ void prepare_kernel(Model& model, Kernel k) {
         }
         vnni_layers++;
     }
+
+#if ENGINE_HAS_CUDA
+    if (k == Kernel::CudaFp32 || k == Kernel::CudaInt8 ||
+        k == Kernel::CudaInt8Fused) {
+        std::cout << "CUDA device: " << cuda_device_summary() << std::endl;
+        cuda_prepare_layers(model, k);
+    }
+#endif
 
     if (k == Kernel::VnniInt8) {
         std::cout << "Repacked " << vnni_layers << " of " << model.conv_layers.size()

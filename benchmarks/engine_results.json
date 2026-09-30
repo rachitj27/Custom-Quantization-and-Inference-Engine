@@ -46,5 +46,64 @@
       "smoke": 0.9426
     },
     "note": "original weight-quantization scheme, kept for comparison"
+  },
+  {
+    "label": "Custom C++ engine (per-channel) FP32 GEMM, CUDA on T4",
+    "kernel": "cuda-fp32",
+    "min_ms": 295.2,
+    "median_ms": 365.1,
+    "map50": 0.8826,
+    "per_class": {
+      "fire": 0.7742,
+      "smoke": 0.9909
+    },
+    "gemm_ms": 10.92,
+    "phases_ms": {
+      "h2d": 2.62,
+      "im2col": 6.04,
+      "gemm": 16.25,
+      "d2h": 5.44,
+      "host_epilogue": 123.63,
+      "host_rest": 145.89
+    },
+    "note": "Colab Tesla T4, sm_75, CUDA 12.8; --bench 3 in one process. im2col plus the 2D register-tiled SGEMM from cuda-gemm-from-scratch, bit-identical to the verbatim kernel at M=N=K=4096 and passing all 32 of the network's shapes. GEMM is 10.92 ms per image measured warm by cuda/gemm_selftest, 4.041 GMAC at 370 GMAC/s, against 17.3 GMAC/s for AVX-VNNI on one laptop core. The wall clock is not GEMM-bound: only 30.4 ms of it is on the GPU and the remaining 269 ms is the host FP32 epilogue and the CPU requantize/concat/pool/NMS, measured with --cuda-profile (which serializes phases, so its 16.25 ms GEMM figure is inflated). mAP equals the INT8 kernels; it is 0.0010 below scalar-fp32's 0.8836, one borderline smoke box on a 51-box set, consistent with the FP32 reduction-order drift of at most 5 INT8 codes measured by compare_dumps.py. Layers 0 and 1 are byte-identical to the CPU FP32 kernel."
+  },
+  {
+    "label": "Custom C++ engine (per-channel) INT8 dp4a GEMM, CUDA on T4",
+    "kernel": "cuda-int8",
+    "min_ms": 290.4,
+    "median_ms": 290.4,
+    "map50": 0.8826,
+    "per_class": {
+      "fire": 0.7742,
+      "smoke": 0.9909
+    },
+    "gemm_ms": 2.55,
+    "phases_ms": {
+      "gemm": 3.97,
+      "d2h": 5.47,
+      "host_epilogue": 129.75,
+      "host_rest": 142.98
+    },
+    "note": "Colab Tesla T4, sm_75, CUDA 12.8; single pass, not the five-process min-of-five protocol the CPU rows use. im2col plus a 2D register-tiled INT8 GEMM using __dp4a, int32 accumulation. Byte-for-byte identical to scalar-int8 on all 22 layer dumps, 9,420,800 elements, zero differing, and mAP plus per-class AP match it exactly, which covers the Detect head convolutions the dumps do not reach. scalar-int8 was already verified identical to vnni-int8, so this matches the AVX-VNNI kernel too. GEMM is 2.55 ms per image measured warm by cuda/gemm_selftest, 4.041 GMAC at 1588 GMAC/s against 17.3 GMAC/s for AVX-VNNI on one laptop core, and 4.2x the FP32 GEMM's 10.63 ms. Peak shapes reach 9417 GOPS, about 29% of the T4's dp4a ceiling. End-to-end is unchanged from the FP32 path because the GEMM is 0.9% of the wall clock: 130 ms is the host FP32 epilogue and 143 ms the CPU requantize/concat/pool/NMS. The D2H does not shrink relative to FP32 despite INT8 inputs, because the accumulator is int32 and therefore the same width; shrinking it needs the epilogue and requantization on the device so the copy can be INT8."
+  },
+  {
+    "label": "Custom C++ engine (per-channel) INT8 dp4a GEMM fused, CUDA on T4",
+    "kernel": "cuda-int8-fused",
+    "min_ms": 62.1,
+    "median_ms": 63.3,
+    "map50": 0.8826,
+    "per_class": {
+      "fire": 0.7742,
+      "smoke": 0.9909
+    },
+    "gemm_ms": 2.55,
+    "phases_ms": {
+      "d2h": 6.77,
+      "device_epilogue": 3.27,
+      "gpu_measured": 22.38,
+      "host_rest": 47.04
+    },
+    "note": "Colab Tesla T4, sm_75, CUDA 12.8; --bench 3 in one process, min of three passes. Same dp4a GEMM as cuda-int8 with the epilogue and the requantization moved onto the device, so convolution returns INT8 and the D2H carries a quarter of the bytes. mAP and both per-class APs are identical to cuda-int8 and to the CPU INT8 kernels, so the drift costs nothing measurable: the device expf differs from glibc's by a ULP, which flips lroundf at rounding ties and shows up as at most 3 INT8 codes on 3 of the 22 layer dumps, but it moves no detection across a threshold. cuda-int8 remains the byte-exact path. 3.8x faster than the 233.5 ms AVX-VNNI figure, and conservatively so, since the host work here runs on a Colab Xeon measured ~2.85x slower than the laptop that produced the VNNI number. Of the 69 ms profiled run, 22 ms is on the GPU and 47 ms is the concat, maxpool, upsample, DFL decode and NMS still on the CPU -- requantization is no longer in that figure."
   }
 ]

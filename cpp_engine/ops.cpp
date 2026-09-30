@@ -10,6 +10,10 @@
 #include <vector>
 
 
+#if ENGINE_HAS_CUDA
+#include "cuda/conv_cuda.h"
+#endif
+
 #if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
 #include <immintrin.h>
 #define ENGINE_HAS_VNNI 1
@@ -295,7 +299,19 @@ FloatTensor conv_vnni_int8(const Tensor& input, const Layer& layer, bool apply_s
 // Dispatch to the selected kernel. Layers the vector path cannot serve, which
 // is only layer 0 with its 3 input channels, fall back to the scalar one.
 FloatTensor conv2d_real(const Tensor& input, const Layer& layer, bool apply_silu) {
-    if (g_kernel == Kernel::ScalarFp32 && !layer.weights_fp32.empty()) {
+#if ENGINE_HAS_CUDA
+    if (g_kernel == Kernel::CudaFp32 && layer.cuda_slot >= 0) {
+        return conv_cuda_fp32(input, layer, apply_silu);
+    }
+    // CudaInt8Fused reaches conv2d_real only from conv2d_float, which needs
+    // an FP32 result, so it borrows the unfused path there.
+    if ((g_kernel == Kernel::CudaInt8 || g_kernel == Kernel::CudaInt8Fused) &&
+        layer.cuda_slot >= 0) {
+        return conv_cuda_int8(input, layer, apply_silu);
+    }
+#endif
+    if ((g_kernel == Kernel::ScalarFp32 || g_kernel == Kernel::CudaFp32) &&
+        !layer.weights_fp32.empty()) {
         return conv_scalar_fp32(input, layer, apply_silu);
     }
 #if ENGINE_HAS_VNNI
@@ -331,6 +347,12 @@ std::unique_ptr<Tensor> conv2d_quant(const Tensor& input,
                                      int out_zp,
                                      bool apply_silu,
                                      const Tensor* residual) {
+#if ENGINE_HAS_CUDA
+    if (g_kernel == Kernel::CudaInt8Fused && layer.cuda_slot >= 0) {
+        return conv_cuda_int8_fused(input, layer, out_scale, out_zp, apply_silu,
+                                    residual);
+    }
+#endif
     FloatTensor real = conv2d_real(input, layer, apply_silu);
 
     auto out = std::make_unique<Tensor>(real.shape, out_scale, out_zp);

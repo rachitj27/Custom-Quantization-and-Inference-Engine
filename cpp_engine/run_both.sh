@@ -5,12 +5,14 @@
 #
 # Produces preds_pt/detections.csv (per-tensor weights) and
 # preds_pc/detections.csv (per-channel weights).
+#
+# ENGINE and KERNEL override the binary and the convolution kernel.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 IMG_DIR="$ROOT/YOLOv8-Fire-and-Smoke-Detection/datasets/fire-8/test/images"
-ENGINE="$HERE/build/custom_engine"
+ENGINE="${ENGINE:-$HERE/build/custom_engine}"
 
 run_one() {
   local prefix="$1" outdir="$2"
@@ -22,7 +24,7 @@ run_one() {
   start=$(date +%s)
   local n=0
   while IFS= read -r img; do
-    "$ENGINE" "$img" \
+    "$ENGINE" "$img" ${KERNEL:+--kernel "$KERNEL"} \
       --model-json "$ROOT/quantization/$prefix.json" \
       --model-bin  "$ROOT/quantization/$prefix.bin" \
       -o "$outdir/$(basename "${img%.*}")_pred.jpg" \

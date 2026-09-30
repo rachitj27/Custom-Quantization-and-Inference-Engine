@@ -57,6 +57,8 @@ struct Layer {
 
     int ic_padded = 0;
 
+    int cuda_slot = -1;
+
     int out_channels() const { return weight_shape[0]; }
 };
 
@@ -120,13 +122,20 @@ struct Detection {
 //   ScalarInt8  the original loop, one INT8 multiply-accumulate at a time
 //   ScalarFp32  the same loop in FP32, as an arithmetic-width baseline
 //   VnniInt8    INT8 through AVX-VNNI, 32 multiply-accumulates per instruction
-enum class Kernel { ScalarInt8, ScalarFp32, VnniInt8 };
+//   CudaFp32    im2col plus an FP32 GEMM on the GPU
+//   CudaInt8    im2col plus an INT8 GEMM on the GPU, dp4a for the dot product
+//   CudaInt8Fused  the same, with the epilogue and requantize on the device
+enum class Kernel { ScalarInt8, ScalarFp32, VnniInt8, CudaFp32, CudaInt8,
+                    CudaInt8Fused };
 
 const char* kernel_name(Kernel k);
 bool parse_kernel(const std::string& name, Kernel& out);
 
 // Whether this CPU actually has the AVX-VNNI instructions.
 bool vnni_supported();
+
+// usable CUDA device present
+bool cuda_supported();
 
 // Build whichever weight representation the kernel needs. Safe to call twice.
 void prepare_kernel(Model& model, Kernel k);

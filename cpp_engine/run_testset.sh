@@ -3,6 +3,11 @@
 #
 #   ./run_testset.sh <image_dir> <output_dir> [max_images]
 #
+# ENGINE overrides the binary (e.g. build-cuda/custom_engine) and KERNEL
+# picks the convolution kernel. Without KERNEL the engine uses its own
+# default, which is vnni-int8 -- so a GPU run scored without it silently
+# measures the CPU path.
+#
 # Writes annotated JPEGs into <output_dir> plus a detections.csv of every box in
 # "image,class_id,class_name,conf,x1,y1,x2,y2" form (640x640 network pixels),
 # which quantization/eval_map.py consumes to score the engine.
@@ -13,7 +18,7 @@ OUT_DIR="${2:?usage: run_testset.sh <image_dir> <output_dir> [max_images]}"
 MAX="${3:-0}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENGINE="$HERE/build/custom_engine"
+ENGINE="${ENGINE:-$HERE/build/custom_engine}"
 
 if [[ ! -x "$ENGINE" ]]; then
   echo "Engine not built: $ENGINE" >&2
@@ -38,7 +43,7 @@ for i in "${!IMAGES[@]}"; do
   img="${IMAGES[$i]}"
   base="$(basename "$img")"
   stem="${base%.*}"
-  "$ENGINE" "$img" -o "$OUT_DIR/${stem}_pred.jpg" --csv-append "$CSV" > /dev/null
+  "$ENGINE" "$img" ${KERNEL:+--kernel "$KERNEL"} -o "$OUT_DIR/${stem}_pred.jpg" --csv-append "$CSV" > /dev/null
   if (( (i + 1) % 10 == 0 )); then
     echo "  ...$((i + 1))/${#IMAGES[@]}"
   fi

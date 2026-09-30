@@ -1,10 +1,10 @@
 """Render the latency charts used in the README.
 
-Two panels. The top one compares the engine's three convolution kernels on a
-linear scale, which is the point: at 234 ms against 3579 ms the vectorized bar
-is a sliver, and that is easier to read than the numbers are. The bottom one
-places the engine against production runtimes on a log scale, because covering
-13.9 ms to 3579 ms linearly would collapse everything but the slowest bar.
+Two panels. The top one compares the engine's own kernels on a linear scale,
+which is the point: at 62 ms against 3579 ms the GPU bar is a sliver, and that
+is easier to read than the numbers are. The bottom one places the engine against
+production runtimes on a log scale, because covering 4.9 ms to 3579 ms linearly
+would collapse everything but the slowest bar.
 
 Writes a light and a dark variant so the README can serve whichever matches the
 reader's GitHub theme.
@@ -22,17 +22,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # (label, milliseconds, is_highlight)
 KERNELS = [
-    ("Vectorized 8 bit\n(AVX-VNNI)", 233.5, True),
+    ("CUDA 8 bit, fused\n(dp4a, T4)", 62.1, True),
+    ("Vectorized 8 bit\n(AVX-VNNI)", 233.5, False),
     ("Plain loop, 8 bit", 3578.7, False),
     ("Plain loop, 32 bit", 3105.9, False),
 ]
 
 RUNTIMES = [
     ("This engine, plain loop", 3578.7, False),
-    ("This engine, vectorized", 233.5, True),
+    ("This engine, vectorized", 233.5, False),
+    ("This engine, CUDA 8 bit", 62.1, True),
     ("PyTorch, 32 bit", 42.4, False),
     ("ONNX Runtime, 32 bit", 24.1, False),
     ("OpenVINO, 8 bit", 13.9, False),
+    ("TensorRT, 8 bit, T4", 4.9, False),
 ]
 
 THEMES = {
@@ -102,18 +105,18 @@ def draw(theme_name, colors):
                  fontweight="bold" if h else "normal")
 
     ax1.set_title(
-        "The same model, the same weights, three ways of doing the arithmetic",
+        "The same model, the same weights, four ways of doing the arithmetic",
         color=colors["fg"], fontsize=13, fontweight="bold", loc="left", pad=14)
 
-    # Call out the headline ratio, with the arrow spanning the actual drop
-    # from the plain 8 bit loop down to the vectorized one.
+    # headline ratio: the GPU bar against the vectorized CPU one
     ax1.annotate(
         "", xy=(vals[0] * 1.04, 0.5), xytext=(vals[1], 0.5),
         arrowprops=dict(arrowstyle="->", color=colors["hi"], linewidth=1.8,
                         shrinkA=0, shrinkB=0),
     )
-    ax1.text((vals[0] + vals[1]) / 2, 0.30, "15x faster", color=colors["hi"],
-             fontsize=12, fontweight="bold", ha="center", va="center")
+    ax1.text(vals[1] * 1.10, 0.5, f"{vals[1] / vals[0]:.1f}x faster",
+             color=colors["hi"], fontsize=12, fontweight="bold", ha="left",
+             va="center")
 
     # ---- Panel 2, against the libraries, log ------------------------------
     rlabels = [r[0] for r in RUNTIMES]
@@ -136,7 +139,7 @@ def draw(theme_name, colors):
     ax2.set_yticks(list(rpos))
     ax2.set_yticklabels(rlabels, color=colors["fg"], fontsize=11)
     ax2.invert_yaxis()
-    ax2.set_xlim(8, 12000)
+    ax2.set_xlim(3, 12000)
     ax2.xaxis.grid(True, color=colors["grid"], linewidth=0.8, which="both")
     ax2.set_xlabel("milliseconds per image, lower is better. Each gridline is ten "
                    "times the one before it", color=colors["muted"], fontsize=10,
@@ -152,8 +155,11 @@ def draw(theme_name, colors):
                   pad=14)
 
     fig.text(0.012, 0.012,
-             "Intel Core Ultra 7 256V, mains power, one configuration per process, "
-             "fastest observed pass. All rows score the same detections.",
+             "CPU rows on an Intel Core Ultra 7 256V, mains power; GPU rows on a "
+             "Colab Tesla T4. One configuration per process, fastest observed\n"
+             "pass. Every row of this engine scores mAP 0.8826, the same "
+             "detections. PyTorch and ONNX are 32 bit at 0.8859; TensorRT in "
+             "8 bit scores 0.8656.",
              color=colors["muted"], fontsize=9)
 
     out = os.path.join(HERE, f"speedup-{theme_name}.png")
