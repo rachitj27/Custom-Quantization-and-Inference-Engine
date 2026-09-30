@@ -1,14 +1,5 @@
-// Verifies the INT8 GEMM formulation against the direct convolution it
-// replaces, on the host, with no GPU. Replicates exactly what conv_cuda_int8
-// and igemm_dp4a_tiled do:
-//
-//   A[m][k]  im2col, holes filled with zero_point
-//   B[k][n]  from weights_hwc, K-major, grouped in fours
-//   acc_raw  = sum_k A[m][k] * B[k][n]          (what dp4a computes)
-//   acc      = acc_raw - zero_point * sum(w)    (the epilogue's correction)
-//
-// and checks acc equals sum over taps of (q - zero_point) * w, which is what
-// conv_scalar_int8 computes directly. Integer throughout, so equality is exact.
+// Host check of the INT8 GEMM formulation against direct convolution.
+// No GPU needed; integer throughout, so exact.
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -31,12 +22,11 @@ static bool run(const Case& t, unsigned seed) {
     const int icp = round_up(t.ic, 16);
     const int kp = t.kh * t.kw * icp;
 
-    // Input, CHW int8.
+    // input, CHW int8
     std::vector<int8_t> in((size_t)t.ic * t.in_h * t.in_w);
     for (auto& v : in) v = (int8_t)rnd(s, -128, 127);
 
-    // Weights OIHW int8, then packed to [oc][kh][kw][icp] exactly as
-    // prepare_kernel does, with weight_sums over the real channels.
+    // weights OIHW, then packed as prepare_kernel does
     std::vector<int8_t> w((size_t)t.oc * t.ic * t.kh * t.kw);
     for (auto& v : w) v = (int8_t)rnd(s, -127, 127);
 
@@ -57,8 +47,7 @@ static bool run(const Case& t, unsigned seed) {
         wsum[o] = sum;
     }
 
-    // --- the GEMM formulation ---
-    // A: [m_real][kp], holes = zero_point.
+    // A: [m_real][kp], holes = zero_point
     std::vector<int8_t> A((size_t)m_real * kp, (int8_t)t.zp);
     for (int mm = 0; mm < m_real; mm++) {
         for (int k = 0; k < kp; k++) {
@@ -80,7 +69,7 @@ static bool run(const Case& t, unsigned seed) {
         }
     }
 
-    // B: [kp/4][oc][4] bytes, i.e. K-major grouped in fours.
+    // B: K-major, grouped in fours
     const int np = t.oc;
     std::vector<int8_t> B((size_t)(kp / 4) * np * 4, 0);
     for (int o = 0; o < t.oc; o++) {
@@ -95,7 +84,7 @@ static bool run(const Case& t, unsigned seed) {
         }
     }
 
-    // acc_raw as dp4a would accumulate it, then the correction.
+    // acc_raw as dp4a accumulates it, then the correction
     int bad = 0;
     for (int mm = 0; mm < m_real; mm++) {
         for (int o = 0; o < t.oc; o++) {
@@ -109,7 +98,7 @@ static bool run(const Case& t, unsigned seed) {
             }
             const int32_t got = raw - t.zp * wsum[o];
 
-            // --- the direct convolution, as conv_scalar_int8 computes it ---
+            // direct convolution, as conv_scalar_int8 computes it
             int32_t want = 0;
             for (int i = 0; i < t.ic; i++) {
                 for (int r = 0; r < t.kh; r++) {
@@ -146,8 +135,7 @@ static bool run(const Case& t, unsigned seed) {
 }
 
 int main() {
-    // The kernel/stride/pad combinations the model actually uses, plus a
-    // deliberately thin layer 0 and an odd zero_point.
+    // the shapes the model uses, plus a thin layer 0 and odd zero points
     const Case cases[] = {
         {3, 16, 3, 3, 32, 32, 2, 1, -128},
         {16, 32, 3, 3, 16, 16, 2, 1, -128},

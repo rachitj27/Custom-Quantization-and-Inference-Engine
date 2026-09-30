@@ -1,10 +1,6 @@
-// The kernel body from cuda-gemm-from-scratch/05_2d_tiling.cu, copied without
-// edits. It exists so gemm_selftest.cu can assert that the templated version in
-// gemm.cuh produces bit-identical output, which keeps "the vendored kernel is
-// unchanged" an assertion rather than a claim.
-//
-// Only the benchmark main() and the cuBLAS comparison were dropped. Compiled
-// into gemm_selftest, not into the engine.
+// cuda-gemm-from-scratch/05_2d_tiling.cu, verbatim apart from dropping its
+// main() and cuBLAS harness. Selftest only, so the templated version can be
+// asserted bit-identical to it.
 
 #include "gemm_reference.cuh"
 

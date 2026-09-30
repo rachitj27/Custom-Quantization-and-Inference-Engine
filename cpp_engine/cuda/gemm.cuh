@@ -1,20 +1,10 @@
 #ifndef GEMM_CUH
 #define GEMM_CUH
 
-// 2D register-tiled SGEMM, from github.com/rachitj27/cuda-gemm-from-scratch
-// (05_2d_tiling.cu), where it reached 3220 GFLOPS at M=N=K=4096 on a T4, or
-// 76.3% of cuBLAS. Each thread computes a TM x TN block of C by outer product
-// in registers, so one pass over the shared tiles feeds TM*TN multiply-adds.
-//
-// Changed from the source: the tile sizes are template parameters instead of
-// #defines, C's beta term is specialized away, and the benchmark main() is
-// gone. The arithmetic and the loop structure are untouched --
-// gemm_selftest.cu asserts this version is bit-identical to the verbatim copy
-// in gemm_reference.cu.
-//
-// No bounds checks, exactly as in the source. Callers pass dimensions already
-// rounded up to the tile sizes and keep the padding region zeroed; see
-// conv_cuda.cu. Row-major throughout: A is MxK, B is KxN, C is MxN.
+// 2D register-tiled SGEMM from github.com/rachitj27/cuda-gemm-from-scratch
+// (05_2d_tiling.cu). Tile sizes templated, beta specialized, benchmark main
+// dropped; arithmetic unchanged. Row-major, A is MxK, B is KxN, C is MxN.
+// No bounds checks: callers pad to the tile and zero the padding.
 
 #include <cuda_runtime.h>
 
@@ -57,6 +47,7 @@ __global__ void sgemm_tiled(int M, int N, int K, float alpha,
     float regN[TN] = {0.0f};
 
     for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
+        // load tiles
         for (int loadOffset = 0; loadOffset < BM; loadOffset += kStrideA) {
             As[(innerRowA + loadOffset) * BK + innerColA] =
                 A[(innerRowA + loadOffset) * K + innerColA];
@@ -71,6 +62,7 @@ __global__ void sgemm_tiled(int M, int N, int K, float alpha,
         A += BK;
         B += BK * N;
 
+        // outer product into registers
         for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
             for (int i = 0; i < TM; ++i) {
                 regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
@@ -88,11 +80,8 @@ __global__ void sgemm_tiled(int M, int N, int K, float alpha,
         __syncthreads();
     }
 
-    // The source always read C to form beta*C, which at beta == 0 still
-    // touches uninitialized memory -- and 0.0f * NaN is NaN. if constexpr
-    // rather than a ternary: the ternary kept the C address live and pushed
-    // this to 130 registers, and at 256 threads anything over 128 costs half
-    // the resident blocks on a T4.
+    // store. if constexpr, not a ternary: the ternary kept C's address live
+    // and cost 2 registers, which halves resident blocks at 256 threads.
     for (int resIdxM = 0; resIdxM < TM; ++resIdxM) {
         for (int resIdxN = 0; resIdxN < TN; ++resIdxN) {
             const int idx = (threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN;
@@ -105,25 +94,8 @@ __global__ void sgemm_tiled(int M, int N, int K, float alpha,
     }
 }
 
-// Tile configurations. N is the output-channel count, which in this network is
-// always a power of two between 2 and 256, and 57.5% of the model's MACs sit at
-// N=64 -- so the narrow configs are the ones that matter, not the 128x128 the
-// kernel was originally tuned for.
-//
-// The narrow tiles also help occupancy. Per ptxas for sm_75, against the T4's
-// 65536 registers and 64 KB of shared memory per SM:
-//
-//   N128  128 reg,  8 KB smem, 256 thr -> 2 blocks/SM, 16 warps, 50%
-//   N64   106 reg, 12 KB smem, 256 thr -> 2 blocks/SM, 16 warps, 50%
-//   N32    72 reg,  6 KB smem, 128 thr -> 7 blocks/SM, 28 warps, 87.5%
-//
-// 128 registers at 256 threads is exactly half the register file, so N128 sits
-// right on the edge of fitting two blocks. Two registers more and it drops to
-// one block and loses about 10% -- measured, not hypothetical, which is why
-// the epilogue below uses if constexpr.
-//
-// 2D register tiling trades occupancy for instruction-level parallelism, so
-// 50% is where this kernel wants to be, not a shortfall.
+// tile configs, picked by N. 57.5% of the model's MACs sit at N=64.
+// sm_75 occupancy: N128 128 reg 2 blocks, N64 106 reg 2, N32 72 reg 7.
 enum class GemmTile { N32, N64, N128 };
 
 struct GemmTileShape {
@@ -145,8 +117,7 @@ inline GemmTile gemm_choose_tile(int n) {
     return GemmTile::N128;
 }
 
-// Launch the instantiation matching `tile`. M, N and K must already be rounded
-// up to the tile's bm/bn/bk.
+// M, N, K must already be rounded up to the tile.
 void gemm_launch(GemmTile tile, int M, int N, int K, float alpha,
                  const float* dA, const float* dB, float beta, float* dC,
                  cudaStream_t stream);

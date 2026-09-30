@@ -1,17 +1,12 @@
 """Diff two directories of engine layer dumps, byte for byte.
 
-compare_layers.py answers "how close is the engine to PyTorch", which is a
-human-read number that is never 100% at 8 bits. This answers a different and
-sharper question: did swapping the kernel change anything at all. It exits
-nonzero when it did, so it works as a gate.
+Unlike compare_layers.py, which measures the engine against PyTorch and never
+reads 100% at 8 bits, this answers whether swapping the kernel changed
+anything, and exits nonzero when it did.
 
-For the INT8 kernels the answer must be zero difference. Integer accumulation
-is order-independent, so a kernel that computes the same dot products in a
-different order still lands on the same int32, and every float operation after
-that runs on the host. Anything else is an indexing bug.
-
-The FP32 kernels are a different story: the reduction order genuinely differs,
-so pass --max-abs-diff 1 there.
+INT8 kernels should show zero difference: integer accumulation is exact and
+order-independent. FP32 kernels do reorder their reduction, so pass
+--max-abs-diff 1 there.
 
 Usage:
     python quantization/compare_dumps.py --a dumps_scalar_int8 --b dumps_cuda_int8
@@ -96,9 +91,7 @@ def main():
         worst = int(d.max()) if d.size else 0
         bad = worst > args.max_abs_diff
 
-        # Mean signed difference separates rounding from a real error. Reduction
-        # order that rounds differently scatters symmetrically about zero; a
-        # wrong scale, a missing bias or a bad index pulls the mean off it.
+        # bias separates rounding (symmetric) from a real error (one-signed)
         bias = float(signed.mean())
 
         print("{:<6} {:>10} {:>9.4f}% {:>10} {:>6} {:>+9.5f}  {}".format(

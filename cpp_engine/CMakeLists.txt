@@ -13,8 +13,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(ENGINE_CUDA "Build the CUDA GEMM convolution backend" OFF)
 
-# Language-guarded: nvcc rejects -Wall outright, and add_compile_options is
-# directory-scoped, so an unguarded list reaches every .cu in the tree.
+# language-guarded: nvcc rejects -Wall, and this is directory-scoped
 add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-O2>")
 
 find_package(nlohmann_json 3.2.0 REQUIRED)
@@ -43,8 +42,7 @@ if(ENGINE_CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-  # T4 on Colab. Settable without a device attached, so the local WSL box
-  # compiles and links the same binary it cannot run.
+  # T4. Settable with no device attached, so a GPU-less box can still build.
   if(NOT CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 75)
   endif()
@@ -57,13 +55,12 @@ if(ENGINE_CUDA)
   )
   target_compile_definitions(custom_engine PRIVATE ENGINE_HAS_CUDA=1)
 
-  # --fmad=false keeps a*b+c uncontracted so device products match the host,
-  # which builds without -march/-mfma. Never --use_fast_math here: the FP32
-  # epilogue has to stay reproducible against the scalar kernel.
+  # --fmad=false so device products match the host, which has no -mfma.
+  # never --use_fast_math: the FP32 epilogue must stay reproducible.
   target_compile_options(custom_engine PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;--ftz=false;--prec-div=true;--prec-sqrt=true;-lineinfo;-Xcompiler=-Wall,-Wextra>")
 
-  # Exercises the kernels on their own, with no model or engine involved.
+  # kernels on their own, no model or engine
   add_executable(gemm_selftest
     cuda/gemm_selftest.cu
     cuda/gemm.cu

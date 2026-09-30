@@ -6,7 +6,7 @@
 
 namespace {
 
-// dp4a needs sm_61. Below that the INT8 path has no instruction to reach for.
+// dp4a needs sm_61
 constexpr int kMinComputeCapability = 61;
 
 bool pick_device(cudaDeviceProp& prop) {

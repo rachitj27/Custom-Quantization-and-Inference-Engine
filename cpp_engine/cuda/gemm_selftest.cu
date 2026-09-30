@@ -1,14 +1,9 @@
-// Standalone harness for the GEMM kernels, independent of the engine.
-//
-// Two things get checked. First, that the templated kernel in gemm.cuh is
-// bit-identical to the verbatim vendored copy at M=N=K=4096, which is the shape
-// it was originally tuned and measured at. Second, that all three tile
-// configurations are correct on the 32 distinct (M, N, K) triples this network
-// actually produces -- and how fast they are there, which is a very different
-// question from the 4096 number.
+// Exercises the GEMM kernels on their own. Checks the templated kernel is
+// bit-identical to the verbatim copy at 4096, then runs all 32 shapes the
+// network produces through both the FP32 and INT8 paths.
 //
 //   ./gemm_selftest            all checks
-//   ./gemm_selftest --shapes   skip the 4096 equivalence check
+//   ./gemm_selftest --shapes   skip the 4096 check
 
 #include "gemm.cuh"
 #include "gemm_reference.cuh"
@@ -32,10 +27,8 @@ namespace {
         }                                                                        \
     } while (0)
 
-// The GEMM shape of every convolution in the model, deduped. M is out_h*out_w,
-// N is out_ch, K is kh*kw*ic_padded, and layers is how many of the 63
-// convolutions have this shape -- which is what turns per-shape timings into a
-// per-image projection.
+// Every convolution's GEMM shape, deduped. M = out_h*out_w, N = out_ch,
+// K = kh*kw*ic_padded, layers = how many of the 63 convs share it.
 struct Shape {
     int m, n, k, layers;
 };
@@ -57,8 +50,7 @@ constexpr int kNumShapes = static_cast<int>(sizeof(kShapes) / sizeof(kShapes[0])
 
 int round_up(int v, int m) { return ((v + m - 1) / m) * m; }
 
-// Deterministic, and spread across the exponent range enough that a wrong
-// index shows up instead of averaging out.
+// deterministic, spread enough that a wrong index shows up
 float value_at(unsigned i) {
     unsigned h = i * 2654435761u;
     h ^= h >> 15;
@@ -82,8 +74,7 @@ bool check_4096() {
     CUDA_OK(cudaMemcpy(dA, hA.data(), bytes, cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(dB, hB.data(), bytes, cudaMemcpyHostToDevice));
 
-    // beta = 0, so the reference must not be handed uninitialized memory --
-    // that is the bug the templated version specializes away.
+    // beta = 0, so the reference must not read uninitialized memory
     CUDA_OK(cudaMemset(dRef, 0, bytes));
     CUDA_OK(cudaMemset(dNew, 0, bytes));
 
@@ -101,7 +92,7 @@ bool check_4096() {
         if (std::memcmp(&hRef[i], &hNew[i], sizeof(float)) != 0) differing++;
     }
 
-    // Time both while the buffers are still around.
+    // time both
     cudaEvent_t start, stop;
     CUDA_OK(cudaEventCreate(&start));
     CUDA_OK(cudaEventCreate(&stop));
@@ -137,9 +128,7 @@ bool check_4096() {
     return differing == 0;
 }
 
-// Reference dot products for a sample of output positions. A full host GEMM
-// over every shape would take minutes and prove nothing extra; a spread of
-// sampled positions catches an indexing error just as well.
+// sampled reference dot products; a full host GEMM proves nothing extra
 bool check_shape(const Shape& s, double* out_gflops, double* out_ms) {
     const GemmTile tile = gemm_choose_tile(s.n);
     const GemmTileShape ts = gemm_tile_shape(tile);
@@ -155,8 +144,7 @@ bool check_shape(const Shape& s, double* out_gflops, double* out_ms) {
     std::vector<float> hA(static_cast<size_t>(mp) * kp, 0.0f);
     std::vector<float> hB(static_cast<size_t>(kp) * np, 0.0f);
 
-    // Only the real region carries data; the padding stays zero, which is what
-    // makes the padded GEMM exact rather than approximate.
+    // padding stays zero, which is what makes the padded GEMM exact
     for (int m = 0; m < s.m; m++) {
         for (int k = 0; k < s.k; k++) {
             hA[static_cast<size_t>(m) * kp + k] = value_at(static_cast<unsigned>(m * 131 + k));
@@ -205,12 +193,9 @@ bool check_shape(const Shape& s, double* out_gflops, double* out_ms) {
         }
     }
 
-    // Gate on absolute error, not relative. The inputs are in [-1, 1], so a
-    // K-term sum accumulates at most about K * FLT_EPSILON of rounding; the
-    // factor of 8 is slack. Relative error is the wrong gate here because a
-    // dot product of random signs lands near zero often enough that a
-    // perfectly good answer shows a huge ratio -- which is exactly what an
-    // earlier 1e-4 relative threshold flagged on 29 of these 32 shapes.
+    // Gate on absolute error: inputs are in [-1, 1] so a K-term sum rounds by
+    // at most about K * FLT_EPSILON. Relative error is the wrong gate, since a
+    // dot product of random signs often lands near zero.
     const double atol = 8.0 * s.k * 1.1920929e-7;
 
     cudaEvent_t start, stop;
@@ -228,8 +213,7 @@ bool check_shape(const Shape& s, double* out_gflops, double* out_ms) {
     CUDA_OK(cudaEventElapsedTime(&ms, start, stop));
     ms /= runs;
 
-    // Report against the useful work, not the padded work -- padding is
-    // overhead, so counting it would flatter the number.
+    // against useful work, not padded
     const double useful = 2.0 * s.m * s.n * s.k;
     *out_gflops = (useful / 1e9) / (ms / 1000.0);
     *out_ms = ms;
@@ -251,9 +235,7 @@ bool check_shape(const Shape& s, double* out_gflops, double* out_ms) {
     return ok;
 }
 
-// The INT8 kernel gets no tolerance: int32 accumulation is exact, so any
-// difference from a host reference is a bug, not rounding. That makes this a
-// far sharper localizer than an end-to-end dump diff.
+// no tolerance: int32 accumulation is exact, so any difference is a bug
 bool check_shape_int8(const Shape& s, double* out_ms) {
     const IgemmTile tile = igemm_choose_tile(s.n);
     const IgemmTileShape ts = igemm_tile_shape(tile);
@@ -385,14 +367,9 @@ int main(int argc, char** argv) {
         layers += kShapes[i].layers;
     }
 
-    // Weighted by how many layers share each shape, so this is the GEMM cost
-    // of one forward pass -- not an average over shapes, which would count a
-    // shape used once as heavily as one used eleven times.
-    //
-    // Two MAC counts, because only one of them is work the model needs. K here
-    // is kh*kw*ic_padded, so image_flop includes the channel rounding; the
-    // model's actual arithmetic is 4.041 GMAC. Rate is reported against the
-    // real figure, since crediting the padding would flatter it.
+    // Weighted by layer count, so this is one forward pass. K includes the
+    // channel rounding; the model's real arithmetic is 4.041 GMAC, and the
+    // rate is reported against that.
     constexpr double kModelGmac = 4.041;
     const double padded_gmac = image_flop / 2e9;
     std::printf("\n  GEMM time for one image: %.2f ms over %d convolutions\n",

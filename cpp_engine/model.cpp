@@ -228,11 +228,7 @@ void prepare_kernel(Model& model, Kernel k) {
 
         // VnniInt8: repack [oc][ic][kh][kw] -> [oc][kh][kw][ic_padded].
         if (!layer.weights_hwc.empty()) continue;
-        // VNNI leaves thin layers on the scalar kernel, which costs little
-        // there. On the GPU it would drop layer 0 onto a 1.1 GMAC/s loop
-        // and cost about 40 ms, so the CUDA path packs it and eats the
-        // padding: ic 3 -> 16 makes its K 144 instead of 27, which is 5.3x
-        // the work on a layer worth 1.1% of the model.
+        // CUDA packs thin layers too: leaving layer 0 scalar costs ~40 ms
         if (ic < kMinVnniChannels && k != Kernel::CudaInt8) continue;
 
         const int icp = round_up(ic, kChannelAlign);

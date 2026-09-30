@@ -164,8 +164,7 @@ std::vector<std::string> read_class_names(const std::string& json_path) {
 }
 
 void dump_layers(const std::vector<std::unique_ptr<Tensor>>& outputs, const std::string& dir) {
-    // Without this the dumps silently go nowhere: every ofstream fails, and
-    // the only sign is a warning per layer that scrolls past.
+    // without this every ofstream fails and only warns
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     if (!std::filesystem::is_directory(dir)) {
@@ -252,8 +251,7 @@ int main(int argc, char** argv) {
         }
 
 #if ENGINE_HAS_CUDA
-        // Off unless asked: it synchronizes per phase per layer, which
-        // serializes the pipeline and inflates the wall clock it is measuring.
+        // off unless asked: syncing per phase inflates the wall clock
         if (opt.cuda_profile) {
             cuda_profile_enable(true);
             cuda_reset_phase_times();

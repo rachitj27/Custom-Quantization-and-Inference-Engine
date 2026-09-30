@@ -1,40 +1,23 @@
 #ifndef IGEMM_CUH
 #define IGEMM_CUH
 
-// INT8 GEMM with int32 accumulation, the same 2D register-tiled structure as
-// gemm.cuh with the FP32 multiply-add replaced by __dp4a.
-//
-// __dp4a is the GPU counterpart of the VPDPBUSD the CPU kernel uses: two 32-bit
-// words, each holding four packed int8 values, multiplied pairwise and summed
-// into an int32. Four multiply-accumulates per instruction against VNNI's 32,
-// but a T4 issues it on ~2560 cores.
-//
-// The K axis is therefore counted in groups of four. A is [M][K4] and B is
-// [K4][N], both int32, where element k4 packs K values 4*k4 .. 4*k4+3 -- so the
-// four bytes each operand needs are already adjacent. K in this network is
-// always a multiple of 16, so K4 is always a multiple of 4 and BK4 = 4 divides
-// it exactly: unlike the FP32 path, the K axis needs no padding at all.
-//
-// int32 accumulation is exact and order-independent, so this kernel lands on
-// the same accumulator the CPU INT8 kernel does regardless of how it walks K.
-// That is what makes byte-for-byte parity provable rather than approximate.
+// INT8 GEMM, int32 accumulation. Same tiling as gemm.cuh with the multiply-add
+// replaced by __dp4a (four packed int8 pairs -> int32, the GPU counterpart of
+// VPDPBUSD). K counted in groups of four: A is [M][K4], B is [K4][N], both
+// int32, element k4 packing K values 4*k4..4*k4+3. K is always a multiple of
+// 16 here, so K4 always divides BK4 = 4 and the K axis needs no padding.
 
 #include <cuda_runtime.h>
 
-// MINBLOCKS is the resident-blocks-per-SM target handed to ptxas, and it cuts
-// both ways. Unconstrained, the 128x128 configuration lands on 130 registers
-// and loses half its occupancy to two registers over the 128 budget -- the
-// same cliff the FP32 kernel hit. But asking for a number *below* what a
-// configuration already achieves lets ptxas spend registers freely and costs a
-// block: 128x64 sits at 80 registers and three blocks on its own, and asking
-// for two moved it to 88 and two. So each configuration passes the count it
-// actually reaches, and this acts as a floor rather than a licence.
+// MINBLOCKS is per config, set to the block count that config already reaches.
+// Unconstrained, 128x128 lands on 130 registers and loses half its occupancy;
+// asking for fewer blocks than a tile achieves costs it one.
 template <int BM, int BN, int BK4, int TM, int TN, int MINBLOCKS>
 __global__ __launch_bounds__((BM * BN) / (TM * TN), MINBLOCKS)
 void igemm_dp4a_tiled(int M, int N, int K4,
-                                 const int* __restrict__ A,
-                                 const int* __restrict__ B,
-                                 int* __restrict__ C) {
+                      const int* __restrict__ A,
+                      const int* __restrict__ B,
+                      int* __restrict__ C) {
     constexpr int kThreads = (BM * BN) / (TM * TN);
     constexpr int kStrideA = kThreads / BK4;
     constexpr int kStrideB = kThreads / BN;
@@ -69,6 +52,7 @@ void igemm_dp4a_tiled(int M, int N, int K4,
     int regN[TN] = {0};
 
     for (int bk = 0; bk < K4; bk += BK4) {
+        // load tiles
         for (int loadOffset = 0; loadOffset < BM; loadOffset += kStrideA) {
             As[(innerRowA + loadOffset) * BK4 + innerColA] =
                 A[(innerRowA + loadOffset) * K4 + innerColA];
@@ -83,6 +67,7 @@ void igemm_dp4a_tiled(int M, int N, int K4,
         A += BK4;
         B += BK4 * N;
 
+        // outer product into registers
         for (int dotIdx = 0; dotIdx < BK4; ++dotIdx) {
             for (int i = 0; i < TM; ++i) {
                 regM[i] = As[(threadRow * TM + i) * BK4 + dotIdx];
@@ -102,8 +87,8 @@ void igemm_dp4a_tiled(int M, int N, int K4,
         __syncthreads();
     }
 
-    // No alpha or beta: the scales are per output channel and live in the
-    // epilogue, so there is nothing useful to fold in here.
+    // store. no alpha or beta: the scales are per channel, so they live in the
+    // host epilogue.
     for (int resIdxM = 0; resIdxM < TM; ++resIdxM) {
         for (int resIdxN = 0; resIdxN < TN; ++resIdxN) {
             C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN] =
@@ -112,8 +97,8 @@ void igemm_dp4a_tiled(int M, int N, int K4,
     }
 }
 
-// Mirrors the FP32 tile table. BK4 stays 4 everywhere so the K axis never
-// needs rounding.
+// tile configs. BK4 stays 4 so K never needs rounding.
+// sm_75: N128 124 reg 2 blocks, N64 80 reg 3, N32 62 reg 8. No spills.
 enum class IgemmTile { N32, N64, N128 };
 
 struct IgemmTileShape {
@@ -135,8 +120,7 @@ inline IgemmTile igemm_choose_tile(int n) {
     return IgemmTile::N128;
 }
 
-// M and N must already be rounded up to the tile's bm/bn. K4 must be a
-// multiple of bk4, which holds for every layer in this network.
+// M and N must already be rounded up to the tile.
 void igemm_launch(IgemmTile tile, int M, int N, int K4, const int* dA,
                   const int* dB, int* dC, cudaStream_t stream);
 

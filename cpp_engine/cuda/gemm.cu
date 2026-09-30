@@ -1,8 +1,6 @@
 #include "gemm.cuh"
 
-// Dispatch to the instantiation for the chosen tile. Written out rather than
-// generated so the three configurations that actually get compiled are visible
-// in one place.
+// dispatch to the instantiation for the chosen tile
 void gemm_launch(GemmTile tile, int M, int N, int K, float alpha,
                  const float* dA, const float* dB, float beta, float* dC,
                  cudaStream_t stream) {

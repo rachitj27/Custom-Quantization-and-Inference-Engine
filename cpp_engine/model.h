@@ -132,7 +132,7 @@ bool parse_kernel(const std::string& name, Kernel& out);
 // Whether this CPU actually has the AVX-VNNI instructions.
 bool vnni_supported();
 
-// Whether a usable CUDA device is present.
+// usable CUDA device present
 bool cuda_supported();
 
 // Build whichever weight representation the kernel needs. Safe to call twice.

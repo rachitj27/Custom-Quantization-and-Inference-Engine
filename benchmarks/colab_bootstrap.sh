@@ -6,18 +6,13 @@
 # Then, per iteration:
 #   !cd /content/engine && git pull && cmake --build cpp_engine/build-cuda -j4
 #
-# Colab wipes /content on every disconnect, so the source of truth is always
-# the git branch. Nothing here edits code -- develop locally, push, pull here.
-#
-# A plain git clone is not enough to run the engine: .gitignore excludes *.bin
-# and *.pt, so the quantized model, the test input and best.pt all have to come
-# from the release tarball. That is what ASSET_URL is for.
+# Colab wipes /content on disconnect, so the git branch is the source of
+# truth. A clone alone cannot run the engine -- .gitignore excludes *.bin and
+# *.pt -- so the model, test input and best.pt come from the release tarball.
 set -euo pipefail
 
-# Step out of anything this script is about to delete. A notebook that has
-# already %cd'd into the clone would otherwise lose its working directory the
-# moment ENGINE_DIR is removed, and every command after that fails with
-# "getcwd: cannot access parent directories".
+# step out of anything this deletes, or a notebook %cd'd into the clone
+# loses its working directory when ENGINE_DIR goes
 cd / 2>/dev/null || true
 
 BRANCH="${1:-cuda-gemm-speedup}"
@@ -42,7 +37,7 @@ if [[ -z "$ARCH" ]]; then
   echo "Could not read the compute capability" >&2
   exit 1
 fi
-# dp4a, which the INT8 kernel needs, arrived with sm_61.
+# dp4a needs sm_61
 if (( ARCH < 61 )); then
   echo "Compute capability $CAP is below the sm_61 floor for dp4a" >&2
   exit 1
@@ -52,8 +47,7 @@ echo "Building for sm_$ARCH"
 echo
 echo "=== toolchain ==="
 nvcc --version | tail -2
-# Colab's default gcc is already a version CUDA accepts, so unlike the local
-# WSL box there is no host compiler to pin here.
+# Colab's gcc is already one CUDA accepts, so nothing to pin here
 apt-get -qq install -y nlohmann-json3-dev > /dev/null
 echo "nlohmann-json installed, cmake $(cmake --version | head -1 | awk '{print $3}')"
 
@@ -77,15 +71,13 @@ echo "test_input.bin    $(stat -c%s "$ENGINE_DIR/test_input.bin") bytes"
 
 echo
 echo "=== dataset ==="
-# setup_colab.py remaps the upstream 3-class labels onto the model's 2 classes
-# and drops the six images the local copy does not have. Skipping it gives
-# mAP 0.0000, not a small error.
+# setup_colab.py remaps the 3-class labels to 2 and drops six images.
+# skipping it gives mAP 0.0000.
 rm -rf "$SRC_DIR"
 git clone -q --depth 1 "$UPSTREAM" "$SRC_DIR"
 python "$ENGINE_DIR/benchmarks/setup_colab.py"
 
-# setup_colab.py writes /content/fire-8, but eval_map.py looks for the dataset
-# under the repo root. Bridge the two.
+# setup_colab.py writes /content/fire-8, eval_map.py wants it under the repo
 mkdir -p "$ENGINE_DIR/YOLOv8-Fire-and-Smoke-Detection/datasets"
 ln -sfn /content/fire-8 "$ENGINE_DIR/YOLOv8-Fire-and-Smoke-Detection/datasets/fire-8"
 
@@ -108,10 +100,8 @@ cmake -S "$ENGINE_DIR/cpp_engine" -B "$ENGINE_DIR/cpp_engine/build-cuda" \
   -DCMAKE_CUDA_ARCHITECTURES="$ARCH" > /dev/null
 cmake --build "$ENGINE_DIR/cpp_engine/build-cuda" -j4
 
-# The CPU baseline for correctness. Colab's Xeon has no AVX-VNNI, so the
-# engine falls back to scalar-int8 there -- which is fine as a reference,
-# since scalar and VNNI are already verified byte-identical, but it means the
-# 233.5 ms VNNI figure cannot be reproduced on this machine.
+# CPU baseline. Colab has no AVX-VNNI, so this falls back to scalar-int8 and
+# the 233.5 ms VNNI figure is not reproducible here.
 cmake -S "$ENGINE_DIR/cpp_engine" -B "$ENGINE_DIR/cpp_engine/build" \
   -DCMAKE_BUILD_TYPE=Release > /dev/null
 cmake --build "$ENGINE_DIR/cpp_engine/build" -j4 > /dev/null

@@ -24,9 +24,7 @@ void cuda_check(cudaError_t err, const char* what) {
 
 int round_up(int v, int m) { return ((v + m - 1) / m) * m; }
 
-// Grows to a high-water mark and never shrinks. Because the graph is the same
-// on every image, every allocation happens during the first forward pass and
-// none after -- which is the whole point of not allocating per layer.
+// high-water mark, never per layer
 struct DeviceBuffer {
     void* p = nullptr;
     size_t bytes = 0;
@@ -63,9 +61,7 @@ struct PinnedBuffer {
     }
 };
 
-// Per-layer device state. M is absent because it depends on the input's
-// spatial size, which the caller supplies at inference time. Only the fields
-// for the active kernel are populated.
+// per-layer device state. M comes from the input at call time.
 struct LayerPlan {
     float* d_b_fp32 = nullptr;  // [kp][np], padding zeroed
     int* d_b_int8 = nullptr;    // [kp/4][np] int32 words, padding zeroed
@@ -101,9 +97,7 @@ float elapsed(cudaEvent_t a, cudaEvent_t b) {
     return ms;
 }
 
-// Column k of row m is tap (r, c) of input channel i, at
-// k = (r * kw + c) * icp + i. That is the order the VNNI path packs its
-// weights in, so weights_hwc transposes straight into the B panel.
+// k = (r * kw + c) * icp + i, matching the VNNI weight packing
 __device__ inline void decode_column(int k, int icp, int kw, int* i, int* r, int* c) {
     *i = k % icp;
     const int tap = k / icp;
@@ -140,12 +134,8 @@ __global__ void im2col_fp32(float* __restrict__ A, long long total, int kp,
     }
 }
 
-// The INT8 version keeps the quantized codes and fills every hole with
-// zero_point rather than 0. That is not cosmetic: the epilogue subtracts
-// zero_point * sum(w) over *all* K positions, so a spatially out-of-bounds tap
-// has to carry a code whose real value is zero, and that code is zero_point.
-// Writing 0 there would leave a smooth per-channel bias that still produces
-// plausible detections.
+// holes fill with zero_point, not 0: the correction subtracts
+// zero_point * sum(w) over every K position.
 __global__ void im2col_int8(signed char* __restrict__ A, long long total, int kp,
                             const signed char* __restrict__ in, int in_ch,
                             int in_h, int in_w, int out_w, int kh, int kw,
@@ -248,8 +238,7 @@ void cuda_prepare_layers(Model& model, Kernel kernel) {
             plan.np = round_up(oc, ts.bn);
             plan.kp = round_up(kh * kw * plan.icp, ts.bk);
 
-            // Transpose OIHW into [kp][np] once, here, so the kernel's B loads
-            // stay coalesced along N and the hot path does no reordering.
+            // OIHW -> [kp][np], once
             std::vector<float> panel((size_t)plan.kp * plan.np, 0.0f);
             for (int o = 0; o < oc; o++) {
                 for (int i = 0; i < ic; i++) {
@@ -269,13 +258,10 @@ void cuda_prepare_layers(Model& model, Kernel kernel) {
             plan.tile_int8 = igemm_choose_tile(oc);
             const IgemmTileShape ts = igemm_tile_shape(plan.tile_int8);
             plan.np = round_up(oc, ts.bn);
-            // No K rounding: kh*kw*icp is a multiple of 16, so kp/4 is always a
-            // multiple of bk4 = 4.
+            // no K rounding: kh*kw*icp is a multiple of 16
             plan.kp = kh * kw * plan.icp;
 
-            // weights_hwc is [oc][kh][kw][icp], i.e. already a contiguous
-            // K-vector per output channel. All that is left is transposing it
-            // to K-major and grouping K in fours, which is what dp4a reads.
+            // weights_hwc -> K-major, grouped in fours for dp4a
             const int k4 = plan.kp / 4;
             std::vector<signed char> bytes((size_t)k4 * plan.np * 4, 0);
             for (int o = 0; o < oc; o++) {
@@ -361,13 +347,14 @@ FloatTensor conv_cuda_fp32(const Tensor& input, const Layer& layer, bool apply_s
     CU(cudaGetLastError());
     if (prof) CU(cudaEventRecord(g_ev[3]));
 
+    // D2H the useful sub-block only
     CU(cudaMemcpy2D(g_stage_out.p, (size_t)plan.n * sizeof(float), g_c.p,
                     (size_t)plan.np * sizeof(float), (size_t)plan.n * sizeof(float),
                     (size_t)d.m, cudaMemcpyDeviceToHost));
     if (prof) CU(cudaEventRecord(g_ev[4]));
 
-    // Epilogue stays on the host. CUDA's expf is not glibc's, and a 1 ULP
-    // difference in SiLU can flip lround at a requantization tie.
+    // epilogue on the host: CUDA's expf is not glibc's, and 1 ULP in SiLU
+    // can flip lround at a requantization tie.
     const float* c = (const float*)g_stage_out.p;
     for (int oc = 0; oc < d.out_ch; oc++) {
         const float gain = layer.bn_gain[oc];
@@ -440,9 +427,8 @@ FloatTensor conv_cuda_int8(const Tensor& input, const Layer& layer, bool apply_s
                     cudaMemcpyDeviceToHost));
     if (prof) CU(cudaEventRecord(g_ev[4]));
 
-    // Identical arithmetic to conv_vnni_int8's epilogue, on the same int32.
-    // sum((q - z) * w) == sum(q * w) - z * sum(w), and weight_sums holds
-    // sum(w) with the padded channels contributing nothing.
+    // same epilogue as conv_vnni_int8.
+    // sum((q - z) * w) == sum(q * w) - z * sum(w)
     const int32_t* c = (const int32_t*)g_stage_out.p;
     for (int oc = 0; oc < d.out_ch; oc++) {
         const float m_scale =
