@@ -62,8 +62,6 @@ if(ENGINE_CUDA)
   target_compile_options(custom_engine PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;--ftz=false;--prec-div=true;--prec-sqrt=true;-lineinfo;-Xcompiler=-Wall,-Wextra>")
 
-  set_target_properties(custom_engine PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
   # Exercises the kernels on their own, with no model or engine involved.
   add_executable(gemm_selftest
     cuda/gemm_selftest.cu
