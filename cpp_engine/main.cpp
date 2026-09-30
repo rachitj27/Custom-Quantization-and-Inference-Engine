@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -155,6 +156,15 @@ std::vector<std::string> read_class_names(const std::string& json_path) {
 }
 
 void dump_layers(const std::vector<std::unique_ptr<Tensor>>& outputs, const std::string& dir) {
+    // Without this the dumps silently go nowhere: every ofstream fails, and
+    // the only sign is a warning per layer that scrolls past.
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (!std::filesystem::is_directory(dir)) {
+        throw std::runtime_error("Cannot create dump directory " + dir +
+                                 (ec ? ": " + ec.message() : ""));
+    }
+
     int written = 0;
     for (size_t i = 0; i < outputs.size(); i++) {
         if (!outputs[i]) continue;
