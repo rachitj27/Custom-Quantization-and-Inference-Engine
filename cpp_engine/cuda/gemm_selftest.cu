@@ -296,10 +296,19 @@ int main(int argc, char** argv) {
     // Weighted by how many layers share each shape, so this is the GEMM cost
     // of one forward pass -- not an average over shapes, which would count a
     // shape used once as heavily as one used eleven times.
+    //
+    // Two MAC counts, because only one of them is work the model needs. K here
+    // is kh*kw*ic_padded, so image_flop includes the channel rounding; the
+    // model's actual arithmetic is 4.041 GMAC. Rate is reported against the
+    // real figure, since crediting the padding would flatter it.
+    constexpr double kModelGmac = 4.041;
+    const double padded_gmac = image_flop / 2e9;
     std::printf("\n  GEMM time for one image: %.2f ms over %d convolutions\n",
                 image_ms, layers);
-    std::printf("  %.3f GMAC at %.0f GMAC/s effective\n", image_flop / 2e9,
-                (image_flop / 2e9) / (image_ms / 1000.0));
+    std::printf("  %.3f GMAC of real convolution at %.0f GMAC/s\n", kModelGmac,
+                kModelGmac / (image_ms / 1000.0));
+    std::printf("  (%.3f GMAC issued; the %.1f%% excess is ic_padded rounding)\n",
+                padded_gmac, 100.0 * (padded_gmac / kModelGmac - 1.0));
     std::printf("  for reference: AVX-VNNI on one laptop core is 233.5 ms,\n");
     std::printf("  PyTorch FP32 on a T4 is 8.0 ms, TensorRT INT8 on a T4 is 4.9 ms\n");
 
