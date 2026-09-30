@@ -16,6 +16,7 @@ datasets/
 
 # Build output
 cpp_engine/build/
+cpp_engine/build-cuda/
 
 # Generated benchmark artifacts
 benchmarks/_ov_int8/
