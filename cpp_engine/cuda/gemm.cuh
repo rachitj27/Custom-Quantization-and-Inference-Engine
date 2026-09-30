@@ -103,6 +103,19 @@ __global__ void sgemm_tiled(int M, int N, int K, float alpha,
 // always a power of two between 2 and 256, and 57.5% of the model's MACs sit at
 // N=64 -- so the narrow configs are the ones that matter, not the 128x128 the
 // kernel was originally tuned for.
+//
+// The narrow tiles also win on occupancy, which was not the reason for adding
+// them but is the larger effect. Per ptxas for sm_75, against the T4's 65536
+// registers and 64 KB of shared memory per SM:
+//
+//   N128  130 reg,  8 KB smem, 256 thr -> 1 block/SM,  8 warps, 25%
+//   N64   106 reg, 12 KB smem, 256 thr -> 2 blocks/SM, 16 warps, 50%
+//   N32    72 reg,  6 KB smem, 128 thr -> 7 blocks/SM, 28 warps, 87.5%
+//
+// 2D register tiling is deliberately register-hungry -- it trades occupancy
+// for instruction-level parallelism -- so 25% is not a defect at 128x128. It
+// does mean the layers routed to N64 get both half the padding and twice the
+// resident warps.
 enum class GemmTile { N32, N64, N128 };
 
 struct GemmTileShape {
